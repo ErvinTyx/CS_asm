@@ -1,0 +1,111 @@
+.MODEL SMALL
+.STACK 64
+.DATA
+    ADMIN_U DB 0,0,0,0,0,77,0,99,55,0,66,0,0,0,0,0;"admin$",10 DUP(0)
+    ADMIN_P DB 0,0,0,0,0,99,55,0,0,99,00,11,66,0,0;"admin123$", 7 DUP(0)
+    USER_U DB 0,99,0,0,0,55,33,99,22,99,66,0,0,0,0,0;"USER1$",10 DUP(0);
+    USER_P  DB  0,99,0,0,0,55,33,99,22,99,66,0,0,0,0,0;"USER1$",10 DUP(0);
+    MSGLOG_U DB 13,10,"Enter username : $"
+    MSGLOG_p DB 13,10,"Enter password : $"
+    ENTERED_U DB "admin123$", 7 DUP(0)
+    ENTERED_P DB "admin123$", 7 DUP(0)
+    MENU_S_IN_UP    DB 13,10,"SELECT LOG IN OR SIGN UP (1/2): $"
+    MSGATP  DB 13,10,"INVALID USERNAME OR PASSWORD"
+            DB   13,10, "STILL HAVE $"
+    MSGATP_1 DB " ATTEMPTS LEFT$"
+    I_MENU_S_IN_UP DB 0
+    ERROR DB 0
+    JUMP DB 0
+    TYPE_LOG_IN DB 0
+    ATTEMPT_LOG DB 4
+    ADMIN_INTERFACE_MENU    DB  13,10,"succesfully LOG IN TO ADMIN INTERFACE$"
+    USER_INTERFACE_MENU     DB 13,10, "sucessfully LOG IN TO USER INTERFACE$"
+    MENU_S_IN_UP_E      DB 13,10,"INVALID SYNTAX$"
+    ENCRYTION_TIMES DB 0
+    TEN DB 10
+    Q1 DB 0
+    R1 DB 0
+    Q2 DB 0
+    R2 DB 0
+
+.CODE
+MAIN PROC
+    MOV AX,@DATA
+    MOV DS,AX
+    
+    CALL ENCRYPTION_P
+    CALL CHCK_VALUE
+    MOV AH,4CH
+    INT 21H
+MAIN ENDP
+ENCRYPTION_P PROC
+        MOV ENCRYTION_TIMES,10
+        ENCRYP_SL:
+            MOV CX,15
+            MOV SI,0
+        ENCRYP_MOVP:;---- START MOVING ONE POSTISION FORWARD TO EACH BYTE
+            MOV AL,ENTERED_U[SI]
+            MOV AH,ENTERED_P[SI]
+            XCHG ENTERED_U[SI+1],AL
+            XCHG ENTERED_P[SI+1],AH
+            MOV ENTERED_U[SI],AL
+            MOV ENTERED_P[SI],AH
+            INC SI
+            MOV DI,0
+        LOOP ENCRYP_MOVP
+        OPEREATION_XOR:
+            MOV AL,ENTERED_U[DI]
+            MOV AH,ENTERED_P[DI]
+            XOR AL,ENTERED_U[DI+8]
+            XOR AH,ENTERED_P[DI+8]
+            MOV ENTERED_U[DI],AL
+            MOV ENTERED_P[DI],AH
+            INC DI
+            CMP DI,8
+            JL OPEREATION_XOR
+            CMP ENCRYTION_TIMES,0
+            JG CONTINUE_ENCRY
+            JE END_ENCRY_PROC
+        CONTINUE_ENCRY:
+            DEC ENCRYTION_TIMES
+            JMP ENCRYP_SL
+        END_ENCRY_PROC:
+            RET      
+ENCRYPTION_P ENDP
+DECRYPTION_P PROC
+        MOV ENCRYTION_TIMES,10
+        DECRYP_SL:
+            MOV CX,15
+            MOV SI,15
+            MOV DI,0
+        OPEREATION_XOR_DECRYP:
+            MOV AL,ENTERED_U[DI]
+            MOV AH,ENTERED_P[DI]
+            XOR AH,ENTERED_P[DI+8]
+            XOR AL,ENTERED_U[DI+8]
+            MOV ENTERED_U[DI],AL
+            MOV ENTERED_P[DI],AH
+            INC DI
+            CMP DI,8
+            JL OPEREATION_XOR_DECRYP
+            
+        DECRYP_MOVP:;---- START MOVING ONE POSTISION BACKWARD TO EACH BYTE
+            MOV AL,ENTERED_U[SI]
+            MOV AH,ENTERED_P[SI]
+            XCHG ENTERED_U[SI-1],AL
+            XCHG ENTERED_P[SI-1],AH
+            MOV ENTERED_P[SI],AH
+            MOV ENTERED_U[SI],AL
+            DEC SI
+        LOOP DECRYP_MOVP
+        CMP ENCRYTION_TIMES,0
+        JG CONTINUE_DECRYP
+        JE END_DECRYP_PROC
+        CONTINUE_DECRYP:
+            DEC ENCRYTION_TIMES
+            JMP DECRYP_SL
+        END_DECRYP_PROC:
+        RET
+DECRYPTION_P ENDP   
+
+    END MAIN
