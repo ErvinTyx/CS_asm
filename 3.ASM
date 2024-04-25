@@ -1,650 +1,144 @@
-.MODEL SMALL
-.STACK 64
-.DATA
-    ADMIN_U DB 00H,6EH,00H,00H,00H,61H,64H,6DH,69H,6EH,24H,00H,00H,00H,00H,00H;"admin$",10 DUP(0)
-    ADMIN_P DB 00H,6EH,00H,32H,00H,45H,64H,6DH,69H,6EH,31H,32H,33H,24H,00H,00H;"admin123$", 7 DUP(0)
-    USER_U DB 00H,31H,00H,00H,00H,55H,53H,45H,52H,31H,24H,00H,00H,00H,00H,00H;"USER1$",10 DUP(0);
-    USER_P  DB  00H,31H,00H,00H,00H,55H,53H,45H,52H,31H,24H,00H,00H,00H,00H,00H;"USER1$",10 DUP(0);
-    MSGLOG_U DB 13,10,"Enter username : $"
-    MSGLOG_p DB 13,10,"Enter password : $"
-    ENTERED_U DB 16 DUP(0)
-    ENTERED_P DB 16 DUP(0)
-    MENU_S_IN_UP    DB 13,10,"SELECT LOG IN OR SIGN UP (1/2): $"
-    MSGATP  DB 13,10,"INVALID USERNAME OR PASSWORD"
-            DB   13,10, "STILL HAVE $"
-    MSGATP_1 DB " ATTEMPTS LEFT$"
-    I_MENU_S_IN_UP DB 0
-    ERROR DB 0
-    JUMP DB 0
-    TYPE_LOG_IN DB 0
-    ATTEMPT_LOG DB 4
-    ADMIN_INTERFACE_MENU    DB  13,10,"succesfully LOG IN TO ADMIN INTERFACE$"
-    USER_INTERFACE_MENU     DB 13,10, "sucessfully LOG IN TO USER INTERFACE$"
-    MENU_S_IN_UP_E      DB 13,10,"INVALID SYNTAX$"
-    MSGE_UID_LENGTH DB 13,10,"INVALID LENGTH USERID"
-                    DB 13,10,"USER ID LENGTH MUST BE AT LEAST 8 CHARACTERS$"
-    MSGE_P_LENGTH    DB 13,10,"INVALID LENGTH PASSWORD"
-                    DB 13,10,"PASSWORD LENGTH MUST BE AT LEAST 8 CHARACTERS$"
-    MSGE_P_SC   DB 13,10,"PASSWORD MUST HAVE SPEACIAL CHARACTERS$"
-    MSGE_P_UC   DB 13,10,"PASSWORD MUST HAVE UPPERCASE CHARACTERS$"
-    MSGE_P_LC   DB 13,10,"PASSWORD MUST HAVE LOWERCASE CHARACTERS$"
-    MSGE_P_NUM  DB 13,10,"PASSWORD MUST HAVE NUMBER$"
-    ENCRYTION_TIMES DB 0
-    T_ERROR DB 0
-.CODE
-MAIN PROC FAR
-    MOV AX, @DATA
-    MOV DS, AX
-START:
-    MOV JUMP,0
-    MOV ATTEMPT_LOG,4
-    CMP ERROR,0
-    JE PRINT1
-    JNE PRINT2
-PRINT2:;-- ERROR MSG
-    MOV AH,09H
-    LEA DX,MENU_S_IN_UP_E
-    INT 21H
-
-PRINT1:
-    MOV AH,09H
-    LEA DX,MENU_S_IN_UP
-    INT 21H
-
-    MOV AH,01H
-    INT 21H    
-    MOV I_MENU_S_IN_UP,AL ; INPUT BYTE IF MENU SELECTION SIGN IN / UP
-    JMP V_MENU_S_IN_UP
-
-V_MENU_S_IN_UP:;VALIDATION FOR MENU INPUT 
-    CMP I_MENU_S_IN_UP,31H
-    JE E_LOGIN
-    CMP I_MENU_S_IN_UP,32H
-    JE SIGNUP
-    ;IF NOT 1 AND TWO PRINT ERROR
-    MOV ERROR,1
-    JNE START
-
-E_LOGIN: 
-    MOV ERROR,0
-    CALL CLEAR_UIP_PROC
-    CALL GET_E_U
-    CMP JUMP,1
-    JE START;IF USER PRESS ESCAPE KEY
-    CALL GET_E_P
-    CMP JUMP,1
-    JE START;IF USER PRESS ESCAPE KEY
-    CALL ENCRYPTION_P;ENCRYPTION FOR THE DATA THAT IS INPUTTED
-    CALL VALIDATION_UIDP; COMPARISON FOR THE PASSWORD AND USERID THAT HAS ENTERED IS THE SAME ANOT WITH THE ENCRYPTED PASSWORD AND USERNAME
-    CMP TYPE_LOG_IN,0 ; IF TYPE 0 MEANS WRONG USERNAME OR PASSWORD, 1 ADMIN ,2 USER 
-    JE INVALID_LOG;JUMP AND PROMPT INVALID MESSAGE
-    CMP TYPE_LOG_IN,1
-    JE ADMIN_INTERFACE;JUMP TO ADMIN INTERFACE
-    CMP TYPE_LOG_IN,2
-    JE USER_INTERFACE;JUMP TO USER INTERFACE
-
-INVALID_LOG:
-    DEC ATTEMPT_LOG
-    CMP ATTEMPT_LOG,1
-    JG PRINT_ATTEMPT ; if GREATER THAN 1 JUMP PRINT ATTEMPT 
-    JL START_CONNECTION
-START_CONNECTION:
-    JMP START
-PRINT_ATTEMPT:
-    ; --- 
-    MOV AH, 09H
-    LEA DX,MSGATP
-    INT 21H
-    ; print byte num of attempt 
-    MOV AH,02H
-    MOV DL,ATTEMPT_LOG
-    ADD DL,30H
-    INT 21H
-    ; msg "attempts left
-    MOV AH,09H
-    LEA DX,MSGATP_1
-    INT 21H
-
-    JMP E_LOGIN ; FINISH PROMPT HOW MANY ATTEMPTS LEFT JUMP BACK TO CONTINUE USER LOG IN
-    
-ADMIN_INTERFACE:; PRINT ADMIN MENU 
-    ;XXXXXXXXXXXXXXXXXXXXXXXX
-     ; test line promt admin interface 
-    MOV AH,09H
-    LEA DX,ADMIN_INTERFACE_MENU
-    INT 21H
-    JMP END_MAIN
-    ;-XXXXXXXXXXXXXXXXXXXXXXX
-USER_INTERFACE:
-    ;TEST LINE FOR USER INTERFACE
-    MOV AH,09H
-    LEA DX,USER_INTERFACE_MENU
-    INT 21H
-    JMP END_MAIN
-
-SIGNUP:
-    CALL GET_E_U
-    CMP JUMP,1
-    JE START_CONNECTION
-    CALL GET_E_P
-    CMP JUMP,1
-    JE START_CONNECTION
-    CALL MOVE_UP_USER
-    JMP START_CONNECTION
-END_MAIN:
-    MOV ERROR,0
-    MOV AH,4CH
-    INT 21H
-
-MAIN ENDP
-    GET_E_U PROC
-        U_LOGIN_U:;ENTER LOGIN PAGE
-        ;--- CLEAR ERROR VALIDATION FROM PREVIOUS VALIDATION FOR MENU INPUT 
-            MOV ERROR,0
-        ;---- PRINT MSG FOR ENTER USERNAME
-            MOV AH,09H
-            LEA DX,MSGLOG_U
-            INT 21H
-        ;---------------------------------------------------------
-
-        L_G_E_U:;LOOPING FOR GET USER INPUT USERNAME
-            MOV CX, 15
-            MOV SI,0
-        E_UID:;--- GET USER NAME
-            MOV AH,07H
-            INT 21H
-            CMP AL,1BH;IF USER PRESS ESC
-            JE R_G_E_U ;--RETURN TO MENU SELECTION FROM LOG IN
-            CMP AL,0DH ;--- IF USER PRESS ENTERED KEY
-            JE E_E_U;-- ENTERED_KEY USERNAME
-            CMP AL,08H; IF USER PRESS BACKSPACE
-            JE I_UID_BACKSPACE ;--- INPUT USER ID BACKSPACE
-            CMP AL,20H ; COMPARE WHERE IT IS IN RANGE ANOT
-            JL E_UID;JMP BACK TO E_UID BELOW RANGE 20H
-            CMP AL,7EH
-            JG E_UID  ;JMP BACK TO E_UID GEATER RANGE 7EH
-            ;---- IF IN RANGE PRINT
-            ;------ INSERT INTO 
-            MOV ENTERED_U[SI],AL
-            ;--- OUTPUT BYTE
-            MOV AH,02H
-            MOV DL,AL
-            INT 21H
-            ;---- INCREASE POSITION IN ARRAY
-            INC SI
-            LOOP E_UID;--- CONTINUE GET NEXT LETTER
-            ;-- IF FINISH 15 CHARCTERS AUTOMATICALY ENTER STRING
-        E_E_U:
-            CMP I_MENU_S_IN_UP, 32H; IF IS IN SIGNUP MODE
-            ;JMP TO CHECK VALIDATION
-            JE SIGNUP_VALIDATION_UID
-            
-            JMP END_GET_E_U
-
-        SIGNUP_VALIDATION_UID:
-            CMP SI,7
-            JL SIGNUP_UID_ERROR;IF STRING LENGTH IS LESS THAN 8
-            JGE END_GET_E_U
-        SIGNUP_UID_ERROR:
-            ;CLEAR SCREEN
-            ;RESET CURSOR
-            ;PROMRPT ERROR MSG ABOUT USER ID LENGTH MUST BE AT LEAST 8 CHARACTERS
-            MOV AH,09H
-            LEA DX,MSGE_UID_LENGTH
-            INT 21H
-            JMP U_LOGIN_U
-
-        I_UID_BACKSPACE:;-- IF USER ENTER BACK SPACE
-        cmp si,0
-        je E_UID ; JUMP IF EQUAL TO POSITION 0
-        
-        ;PRINT BACK SPACE 
-        MOV AH,02H
-        MOV DL,08H
-        INT 21H
-        ;PRINT A SPACE OVER THE PREVIOUS CHAR
-        MOV AH,02H
-        MOV DL," "
-        INT 21H
-        ;PRINT BACK SPACE
-        MOV AH,02H
-        MOV DL,08H
-        INT 21H
-
-        DEC SI
-        INC CX
-        JMP E_UID
-
-        ;PRINT ONE BYTE TO 
-        R_G_E_U:
-            MOV JUMP,1; TURN THIS FLAG TO TRUE
-            JMP END_GET_E_U
-        END_GET_E_U:
-            MOV ENTERED_U[SI],'$'
-            RET
-GET_E_U ENDP    
-GET_E_P PROC
-        U_LOGIN_P:;ENTER LOGIN PAGE
-        ;--- CLEAR ERROR VALIDATION FROM PREVIOUS VALIDATION FOR MENU INPUT 
-            MOV ERROR,0
-        ;---- PRINT MSG FOR ENTER PASSWORD
-            MOV AH,09H
-            LEA DX,MSGLOG_P
-            INT 21H
-        ;---------------------------------------------------------
-        L_G_E_P:;LOOPING FOR GET USER INPUT USERNAME
-            MOV CX, 15
-            MOV SI,0
-        E_P:;--- GET USER NAME
-            MOV AH,07H
-            INT 21H
-            CMP AL,1BH;IF USER PRESS ESC
-            JE R_G_E_P ;--RETURN TO MENU SELECTION FROM LOG IN
-            CMP AL,0DH ;--- IF USER PRESS ENTERED KEY
-            JE E_E_P;-- ENTERED_KEY PASSWORD
-            CMP AL,08H; IF USER PRESS BACKSPACE
-            JE I_P_BACKSPACE ;--- INPUT USER ID BACKSPACE
-            CMP AL,20H ; COMPARE WHERE IT IS IN RANGE ANOT
-            JL E_P;JMP BACK TO E_UID BELOW RANGE 20H
-            CMP AL,7EH
-            JG E_P  ;JMP BACK TO E_UID GEATER RANGE 7EH
-            ;---- IF IN RANGE PRINT
-            ;------ INSERT INTO 
-            MOV ENTERED_P[SI],AL
-            ;--- OUTPUT BYTE
-            MOV AH,02H
-            MOV DL,"*"
-            INT 21H
-            ;---- INCREASE POSITION IN ARRAY
-            INC SI
-            LOOP E_P;--- CONTINUE GET NEXT LETTER
-;-----------------------------------------------------------------
-        E_E_P:
-            CMP I_MENU_S_IN_UP,32H;-- SIGNUP
-            JNE END_GET_E_P; NOT EQUAL TO SIGN UP JMP TO 
-            CALL SIGNUP_VALIDATION
-            CALL CLEAR_P_PROC
-            CMP T_ERROR,0
-            JG U_LOGIN_P
-            JE END_GET_E_P
-        
-
-        I_P_BACKSPACE:;-- IF USER ENTER BACK SPACE
-            cmp si,0
-            je E_P ; JUMP IF EQUAL TO POSITION 0
-        
-            ;PRINT BACK SPACE 
-            MOV AH,02H
-            MOV DL,08H
-            INT 21H
-            ;PRINT A SPACE OVER THE PREVIOUS CHAR
-            MOV AH,02H
-            MOV DL," "
-            INT 21H
-            ;PRINT BACK SPACE
-            MOV AH,02H
-            MOV DL,08H
-            INT 21H
-
-            DEC SI
-            INC CX
-            JMP E_P
-
-        R_G_E_P:;-- USER PRESS ESCAPE
-            MOV JUMP,1; TURN THIS FLAG TO TRUE
-            JMP END_GET_E_P
-        END_GET_E_P:
-            MOV ENTERED_P[SI],'$'
-            ;-- IF FINISH 15 CHARCTERS AUTOMATICALY ENTER STRING
-        
-        
-            RET
-GET_E_P ENDP
 SIGNUP_VALIDATION PROC
-        MOV T_ERROR,0
     ;--------------------------------------------------------------------
         SIGNUP_VALIDATION_P:
-            CMP SI,7 ;CHECK LENGTH
-            JL SIGNUP_P_ERROR_LENGTH
-            JGE END_LENGTH
-        SIGNUP_P_ERROR_LENGTH:
-            ;PROMRPT ERROR MSG ABOUT PASSWORD LENGTH MUST BE AT LEAST 8 CHARACTERS
-            MOV AH,09H
-            LEA DX,MSGE_P_LENGTH
-            INT 21H
-            INC T_ERROR
-            JMP END_LENGTH
-        END_LENGTH:
-            ;CHECK HAVE SPECIALE CHARACTER
-            CALL VALIDATION_P_SPEACIAL_CHAR
-            ;print error msg without special character
-            CMP ERROR,1; IF GOT SPEACIAL CHARACTER
-            JE END_SC
-            JNE PMSG_SC
-
-        PMSG_SC:
-            ;PRINT ERROR MSG NO SPECIAL CHAR
-            MOV AH,09H
-            LEA DX,MSGE_P_SC
-            INT 21H
-            INC T_ERROR
-            JMP END_SC
-        END_SC:
-            CALL VALIDATION_P_LOWERCASE
-            ;print error msg without LOWERCASE
-            CMP ERROR,1; IF GOT LOWERCASE
-            JE END_LC
-            JNE PMSG_LC
-
-        PMSG_LC:
-            ;PRINT ERROR MSG NO SPECIAL CHAR
-            MOV AH,09H
-            LEA DX,MSGE_P_LC
-            INT 21H
-            INC T_ERROR
-            JMP END_LC
-
-        END_LC:
-            CALL VALIDATION_P_UPPERCASE
-            ;print error msg without UPPERCASE
-            CMP ERROR,1; IF GOT UPPERCASE
-            JE END_UC
-            JNE PMSG_UC
-
-        PMSG_UC:
-            ;PRINT ERROR MSG NO UPPERCASE
-            MOV AH,09H
-            LEA DX,MSGE_P_UC
-            INT 21H
-            INC T_ERROR
-            JMP END_UC
-        END_UC:
-    ;--------------------------------
-        ;----VALIDATION FOR NUMBER
-    ;---------------------------------
-        CALL VALIDATION_P_NUM
-            ;print error msg without LOWERCASE
-            CMP ERROR,1; IF GOT LOWERCASE
-            JE END_NUM
-            JNE PMSG_NUM
-
-        PMSG_NUM:
-            ;PRINT ERROR MSG NO SPECIAL CHAR
-            MOV AH,09H
-            LEA DX,MSGE_P_NUM
-            INT 21H
-            INC T_ERROR
-            JMP END_NUM
-        END_NUM:
-            
+            CALL VALIDATION_P_SIGNUP
+            CMP T_ERROR,0
+            JE PRINT_EMSG_VAL;INVALID
+            JNE END_SIGNUP_VALIDATION
+        PRINT_EMSG_VAL:;
+            CALL PROMPT_EMSG_TO
+        END_SIGNUP_VALIDATION:
         RET
-SIGNUP_VALIDATION ENDP
-VALIDATION_P_NUM PROC
-    MOV CX,16
-    MOV DI,0
-    MOV ERROR,0
-    CHCK_NUM_RANGE1:
-        CMP ENTERED_P[DI], 30H
-        JGE CHCK_NUM_RANGE1_1
-        JL V_NUM_END_LOOP
-        
+SIGNUP_VALIDATION ENDP; NEED CHANGES FOR SIGNUPVALIDATION
+PROMPT_EMSG_TO PROC
+    ;CLEAR SCRENN
+    CLS
+    ;RESET CURSOR
+    RESETPOSITION
+    PRINTSTRING RED
+    CMP B_VL,0
+    JE PRINT_E_LENGTH
+    JNE CKC_B_VLC
+    PRINT_E_LENGTH:
+        PRINTSTRING MSGE_P_LENGTH
+    CKC_B_VLC:
+        CMP B_VLC,0
+        JE PRINT_E_LC
+        JNE CKC_B_VUC
+    PRINT_E_LC:
+        PRINTSTRINGG MSGE_P_LC
+    CKC_B_VUC:
+        CMP B_VUC,0
+        JE PRINT_E_UC
+    PRINT_E_UC:
+        PRINTSTRING MSGE_P_UC
+    CKC_B_VNUM:
+        CMP B_VNUM,0
+        JE PRINT_E_NUM
+    PRINT_E_NUM:
+        PRINTSTRING MSGE_P_NUM
+    CKC_B_VSC:
+        CMP B_VSC,0
+        PRINTSTRING MSGE_P_SC
 
-    CHCK_NUM_RANGE1_1:
-        CMP ENTERED_P[DI],39H
-        JLE VALID_NUM
-        JG V_NUM_END_LOOP
-    VALID_NUM:
-        MOV ERROR,1
-
-    V_NUM_END_LOOP:
-        INC DI
-        LOOP CHCK_NUM_RANGE1
+    PRITNSTRING DEFAULT_COLOR
     RET
+PROMPT_EMSG_TO ENDP
 
-    RET 
-VALIDATION_P_NUM ENDP
-VALIDATION_P_LOWERCASE PROC
+VALIDATION_P_SIGNUP PROC
     MOV CX,16
     MOV DI,0
-    MOV ERROR,0
-    CHCK_LOWERCASE_RANGE1:
-        CMP ENTERED_P[DI], 61H
-        JGE CHCK_LOWERCASE_RANGE1_1
-        JL V_LC_END_LOOP
-        
-
-    CHCK_LOWERCASE_RANGE1_1:
-        CMP ENTERED_P[DI],7AH
-        JLE VALID_LC
-        JG V_LC_END_LOOP
-    VALID_LC:
-        MOV ERROR,1
-
-    V_LC_END_LOOP:
-        INC DI
-        LOOP CHCK_LOWERCASE_RANGE1
-    RET
-VALIDATION_P_LOWERCASE ENDP
-VALIDATION_P_UPPERCASE PROC
-    MOV CX,16
-    MOV DI,0
-    MOV ERROR,0
-    CHCK_UPPERCASE_RANGE1:
-        CMP ENTERED_P[DI], 41
-        JGE CHCK_UPPERCASE_RANGE1_1
-        JL V_UC_END_LOOP
-        
-    CHCK_UPPERCASE_RANGE1_1:
-        CMP ENTERED_P[DI],5AH
-        JLE VALID_UC
-        JG V_UC_END_LOOP
-    VALID_UC:
-        MOV ERROR,1
-    V_UC_END_LOOP:
-        INC DI
-        LOOP CHCK_UPPERCASE_RANGE1
-    RET
-VALIDATION_P_UPPERCASE ENDP
-VALIDATION_P_SPEACIAL_CHAR PROC
-    MOV CX,16
-    MOV DI,0
-    MOV ERROR,0
+    MOV B_VL,1
+    MOV B_VLC,0
+    MOV B_VNUM,0
+    MOV B_VUC,0
+    MOV B_VSC,0
+    MOV T_ERROR,0
+    CMP SI,7 
+    ;CHECK LENGTH
+        JL SIGNUP_P_ERROR_LENGTH
+        JGE END_LENGTH
+    
+    SIGNUP_ERROR_LENGTH:
+            MOV B_VL,0
+            JMP CHCK_SC_RANGE1_1
+    ;--------------------------------
     CHCK_SC_RANGE1_1:
         CMP ENTERED_P[DI],20H;SPECIAL_CHARACTER RANGE IS 
         JGE CHCK_SC_RANGE1_2
-        JL V_SC_END_LOOP
+        JL V_END_LOOP
     CHCK_SC_RANGE1_2:
-        CMP ENTERED_P,2FH
+        CMP ENTERED_P[DI],2FH
         JLE VALID_SC
+        JG CHCK_NUM_RANGE1
+    ;--------------------------------
+    CHCK_NUM_RANGE1:
+        CMP ENTERED_P[DI], 30H
+        JGE CHCK_NUM_RANGE1_1
+    CHCK_NUM_RANGE1_1:
+        CMP ENTERED_P[DI],39H
+        JLE VALID_NUM
         JG CHCK_SC_RANGE2
-
+    ;----------------------------------
     CHCK_SC_RANGE2:
+        CMP ENTERED_P[DI],3AH;SPECIAL_CHARACTER RANGE IS 
+        JGE CHCK_SC_RANGE2_2
+    CHCK_SC_RANGE2_2:
+        CMP ENTERED_P[DI],40H
+        JLE VALID_SC
+        JG CHCK_UPPERCASE_RANGE1
+    ;-----------------------------------
+    CHCK_UPPERCASE_RANGE1:
+        CMP ENTERED_P[DI], 41H
+        JGE CHCK_UPPERCASE_RANGE1_1
+    CHCK_UPPERCASE_RANGE1_1:
+        CMP ENTERED_P[DI],5AH
+        JLE VALID_UC
+        JG CHCK_SC_RANGE3
+    ;------------------------------------
+    CHCK_SC_RANGE3:
         CMP ENTERED_P[DI],5BH
-        JGE CHCK_SC_RANGE2_1
-        JL V_SC_END_LOOP
-    CHCK_SC_RANGE2_1:
+        JGE CHCK_SC_RANGE3_1
+    CHCK_SC_RANGE3_1:
         CMP ENTERED_P[DI],60H
         JLE VALID_SC
-        JG CHCK_SC_RANGE3
-    CHCK_SC_RANGE3:
+        JG CHCK_SC_RANGE4
+    ;--------------------------------------
+    CHCK_LOWERCASE_RANGE1:
+        CMP ENTERED_P[DI], 61H
+        JGE CHCK_LOWERCASE_RANGE1_1
+    CHCK_LOWERCASE_RANGE1_1:
+        CMP ENTERED_P[DI],7AH
+        JLE VALID_LC
+        JG CHCK_SC_RANGE4
+    ;----------------------------------------
+    CHCK_SC_RANGE4:
         CMP ENTERED_P[DI],7BH
-        JGE CHCK_SC_RANGE3_1
-        JL V_SC_END_LOOP
-
-    CHCK_SC_RANGE3_1:
+        JGE CHCK_SC_RANGE4_1
+    CHCK_SC_RANGE4_1:
         CMP ENTERED_P[DI],7EH
         JLE VALID_SC
-        JG V_SC_END_LOOP
-        VALID_SC:
-            MOV ERROR,1
-
-        V_SC_END_LOOP:;VALIDATE UNTIL END OF LOOP
+        JG V_END_LOOP
+    ;-----------------------------------
+    VALID_LC:
+        MOV B_VLC,1
+        JMP V_END_LOOP
+    VALID_UC:
+        MOV B_VUC,1
+        JMP V_END_LOOP
+    VALID_SC:
+        MOV B_VSC,1
+        JMP V_END_LOOP
+    VALID_NUM:
+        MOV B_VNUM,1
+        JMP V_END_LOOP
+    V_END_LOOP:
         INC DI
-        LOOP CHCK_SC_RANGE1_1
-
-    
-
+        LOOP CHCK_NUM_RANGE1
+        MOV T_ERROR,B_VLC;GOT LOWERCASE
+        AND T_ERROR,B_VUC;GOT UPPERCASE
+        AND T_ERROR,B_VSC;GOT SPECIAL CHARACTER
+        AND T_ERROR,B_VNUM; GOT NUMBER
+        AND T_ERROR,B_VL;VALID LENGTH
     RET
-VALIDATION_P_SPEACIAL_CHAR ENDP
-ENCRYPTION_P PROC
-        MOV ENCRYTION_TIMES,10
-        ENCRYP_SL:
-            MOV CX,15
-            MOV SI,0
-        ENCRYP_MOVP:;---- START MOVING ONE POSTISION FORWARD TO EACH BYTE
-            MOV AL,ENTERED_U[SI]
-            MOV AH,ENTERED_P[SI]
-            XCHG ENTERED_U[SI+1],AL
-            XCHG ENTERED_P[SI+1],AH
-            MOV ENTERED_U[SI],AL
-            MOV ENTERED_P[SI],AH
-            INC SI
-            MOV DI,0
-        LOOP ENCRYP_MOVP
-        OPEREATION_XOR:
-            MOV AL,ENTERED_U[DI]
-            MOV AH,ENTERED_P[DI]
-            XOR AL,ENTERED_U[DI+8]
-            XOR AH,ENTERED_P[DI+8]
-            MOV ENTERED_U[DI],AL
-            MOV ENTERED_P[DI],AL
-            INC DI
-            CMP DI,8
-            JL OPEREATION_XOR
-            CMP ENCRYTION_TIMES,0
-            JG CONTINUE_ENCRY
-            JE END_ENCRY_PROC
-        CONTINUE_ENCRY:
-            DEC ENCRYTION_TIMES
-            JMP ENCRYP_SL
-        END_ENCRY_PROC:
-            RET      
-ENCRYPTION_P ENDP
-DECRYPTION_P PROC
-        MOV ENCRYTION_TIMES,10
-        DECRYP_SL:
-            MOV CX,15
-            MOV SI,15
-            MOV DI,0
-        OPEREATION_XOR_DECRYP:
-            MOV AL,ENTERED_U[DI]
-            MOV AH,ENTERED_P[DI]
-            XOR AH,ENTERED_P[DI+8]
-            XOR AL,ENTERED_U[DI+8]
-            MOV ENTERED_U[DI],AL
-            MOV ENTERED_P[DI],AH
-            INC DI
-            CMP DI,8
-            JL OPEREATION_XOR_DECRYP
-            
-        DECRYP_MOVP:;---- START MOVING ONE POSTISION BACKWARD TO EACH BYTE
-            MOV AL,ENTERED_U[SI]
-            MOV AH,ENTERED_P[SI]
-            XCHG ENTERED_U[SI-1],AL
-            XCHG ENTERED_P[SI-1],AH
-            MOV ENTERED_P[SI],AH
-            MOV ENTERED_U[SI],AL
-            DEC SI
-        LOOP DECRYP_MOVP
-        CMP ENCRYTION_TIMES,0
-        JG CONTINUE_DECRYP
-        JE END_DECRYP_PROC
-        CONTINUE_DECRYP:
-            DEC ENCRYTION_TIMES
-            JMP DECRYP_SL
-        END_DECRYP_PROC:
-        RET
-DECRYPTION_P ENDP   
-CLEAR_UIP_PROC PROC
-        L_CLEAR:;LOOPING CLEAR
-            MOV CX,16;----LOOP COUNTER 16 TIMES
-            MOV SI,0
-
-        CLEAR_E:;---- CLEAR PREVIOUS USER ENTER PASSS AND UID
-            MOV ENTERED_U[SI],0
-            MOV ENTERED_P[SI],0
-            LOOP CLEAR_E
-
-            RET
-CLEAR_UIP_PROC ENDP
-CLEAR_P_PROC PROC; FOR PASSWORD VALIDATION
-        ;LOOPING CLEAR
-            MOV CX,16;----LOOP COUNTER 16 TIMES
-            MOV SI,0
-
-        CLEAR_P:;---- CLEAR PREVIOUS USER ENTER PASSS 
-            MOV ENTERED_P[SI],0
-            LOOP CLEAR_P
-
-            RET
-CLEAR_P_PROC ENDP
-VALIDATION_UIDP PROC
-    ;;- VALIDATION FOR PASSWORD
-    V_UIDA_SL:
-        MOV CX,16
-        MOV SI,0
-    V_UIDA:;validation for admin
-        MOV AL,ENTERED_U[SI]
-        CMP AL, ADMIN_U[SI]
-        JNE V_UID_SL;-if not same jump to 
-        INC SI
-    LOOP V_UIDA
-    JMP V_PA_SL
-    V_PA_SL:;-- VALIDATION PASSWORD FOR ADMIN
-        MOV CX,16
-        MOV SI,0
-        JMP V_PA
-    V_PA:
-        MOV AL,ENTERED_P[SI]
-        CMP AL, ADMIN_P[SI]
-        JNE WRONGID_OR_PASS;-if not same jump to 
-        INC SI
-    LOOP V_PA
-    ;IF ADMIN AND PASSWORD CORRECT 
-        MOV TYPE_LOG_IN,1
-        JMP END_VALIDATION_UIDP
-
-    V_UID_SL:;validation for userid start loop
-        MOV CX,16
-        MOV SI,0
-        JMP V_UID
-    V_UID:;validation for userid
-        MOV AL,ENTERED_U[SI]
-        CMP AL, USER_U[SI]
-        JNE WRONGID_OR_PASS ;-if not same jump to 
-        INC SI
-    LOOP V_UID
-        JMP V_UP_SL
-    V_UP_SL:
-        MOV CX,16
-        MOV SI,0
-        JMP V_UP
-    V_UP:
-        MOV AL,ENTERED_P[SI]
-        CMP AL, USER_P[SI]
-        JNE WRONGID_OR_PASS ;-if not same jump to 
-        INC SI
-    LOOP V_UP
-
-    ;IF USER ID AND PASSWORD IS CORRECT
-        MOV TYPE_LOG_IN,2
-        JMP END_VALIDATION_UIDP
-    WRONGID_OR_PASS:;IF PASSWORD IS INCORRECT
-        MOV TYPE_LOG_IN,0
-        JMP END_VALIDATION_UIDP
-    END_VALIDATION_UIDP:
-        RET
-VALIDATION_UIDP ENDP
-MOVE_UP_USER PROC
-    MOV CX,16
-    MOV SI,0
-    MOVE_NEW_UIDP:
-        MOV AL, ENTERED_U[SI]
-        MOV USER_U[SI],AL
-        MOV AL,ENTERED_P[SI]
-        MOV USER_P[SI],AL
-        INC SI
-    LOOP MOVE_NEW_UIDP
-    RET
-MOVE_UP_USER ENDP
-    END MAIN
+VALIDATION_P_SIGNUP ENDP
