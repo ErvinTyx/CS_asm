@@ -317,8 +317,11 @@ PRINT_ATTEMPT:
     ; --- 
     PRINTSTRING RED; SET COLOR RED
     PRINTSTRING MSGATP
+    
+    MOV AH,02H
+    MOV DL, ATTEMPT_LOG
     ADD DL,30H
-    OUTPUTBYTE ATTEMPT_LOG; print byte num of attempt 
+    INT 21H; print byte num of attempt 
     ; msg "attempts left
     PRINTSTRING MSGATP_1
     PRINTSTRING DEFAULT_COLOR
