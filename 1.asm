@@ -1,5 +1,23 @@
+; Ice-cream shop, DOS real mode, MASM-compatible 8086 source.
+; Navigation and maintenance notes: docs/1-asm-maintenance.md
+; Source order: constants/macros, data, login/signup, ordering,
+; sales report + 48-bit helpers, order calculation, admin controls.
 .MODEL SMALL
-.STACK 64
+.8086
+
+; Layout constants. Flavour tables all use the order D, A, O, G, M.
+FLAVOUR_COUNT EQU 5
+VALUE_WORDS EQU 3 ; fixed 48-bit representation; helpers address all three words
+VALUE_BYTES EQU VALUE_WORDS * 2
+QUANTITY_COLUMNS EQU 9
+MONEY_COLUMNS EQU 12
+FORMAT_MONEY EQU 0200H ; CH=2 decimal places; add field width in CL
+RETURN_TO_MENU EQU 1
+RETURN_TO_LOGIN EQU 2
+
+.STACK 256 ; shared multiword formatter and nested order checks
+; DOS console macros overwrite AX/DX; screen macros also overwrite BX/CX.
+; DS must address DGROUP before using string or data operations.
  PRINTSTRING MACRO STR
   MOV AH, 09H
   LEA DX,STR
@@ -31,36 +49,14 @@ ENDM
 CLS MACRO
 
  MOV AX, 0600H ; Scroll up window
- MOV BH, 07H   ; Page number
+ MOV BH, 07H   ; Attribute of blank cells (light grey on black)
  MOV CX, 0     ; Upper left corner
  MOV DX, 174FH ; Number of lines to scroll
  INT 10H
 ENDM
 
- FOURDGCAL MACRO D4 ;1234
-  MOV AX,0 ;AX=0000
-  MOV DX,0 ;DX=0000
- 
-  MOV AX,D4 ;AX=1234
-  DIV HUNDRED ;AL=12 DL=34
-  MOV Q1,AL ;Q1=12
-  MOV R1,DL ;R1=34
- 
-  MOV AX,0
-  MOV DX,0
-  MOV AL,Q1 ;AL=12
-  DIV TEN ;AL=01 AH=02
-  MOV Q2,AL ;Q2=01
-  MOV R2,AH ;R2=02
- 
-  MOV AX,0
-  MOV DX,0
-  MOV AL,R1 ;AL=34
-  DIV TEN ;AL=03 AH=04
-  MOV Q3,AL ;Q2=03
-  MOV R3,AH ;R2=04
- ENDM 
 .DATA
+; ---- Login/signup strings and state ----------------------------------
     LOGO_STORE  DB 13,10," _________  _________        ___  ________  _______    "
                 DB 13,10,"|\___   ___\\___   ___\     |\  \|\   ____\|\  ___ \"
                 DB 13,10,"\|___ \  \_\|___ \  \_|     \ \  \ \  \___|\ \   __/|"
@@ -111,6 +107,7 @@ ENDM
     MSGE_P_NUM  DB 13,10,"PASSWORD MUST HAVE NUMBER$"
     ENCRYTION_TIMES DB 0
     T_ERROR DB 0
+; ---- Order menu, current order, and sales ledger ----------------------
      MENU DB 13,10," ----------------------------"
       DB 13,10,"|  CODE  | FLAVOUR |  PRICE  |"
       DB 13,10,"|   D    | DURIAN  | RM 5.80 |"
@@ -121,94 +118,73 @@ ENDM
       DB 13,10, " ----------------------------$"
  MENUASK DB 13,10,13,10,"SELECT YOUR FLAVOUR (ENTER THE CODE): $"
  TAXPRICEMSG DB 13,10,"THE TAX PRICE IS : $"
- ARRAYOFPRICE DW 580,400,450,500,450
- PRICE DW 0
+ ARRAYOFPRICE DW 580,400,450,500,450 ; unit prices in sen, FLAVOUR_IDS order
+ PRICE DW 0 ; selected unit price; 16 bits suffice for the current menu
  QUANTITY DB 13,10,"ENTER QUANTITY (01-10): $"
  FLAVOURCODE DB 0
  QTY1 DB 0
  QTY2 DB 0
  ERROR_CF DB 13,10,"INVALID CODE!$"
  QDERROR DB 13,10,"INVALID QUANTITY RANGE! (01-10)$"
- BOOL DB "F"
+ BOOL DB "F" ; pending invalid-flavour message: 'T' shown once, then cleared
  TEN DB 10
  HUNDRED DW 100
- THOUSAND DW 1000
- TOTALQTY DB 0
- TOTAL DB 0
- R1 DB 0
- R2 DB 0
- R3 DB 0
- R4 DB 0
- R5 DB 0
- Q1 DB 0
- Q2 DB 0
- Q3 DB 0
- Q4 DB 0
- Q5 DB 0
+ TOTALQTY DW VALUE_WORDS DUP(0) ; current order quantity, little-endian
  DISPLAYPRICE DB 13,10,"ITEM PRICE: RM $"
- TOTALPRICE DW 0
- TAX DB 8
- TAXDW DW 8
- TR1 DW 0
- TR2 DB 0
- TR_3 DB 0
- TR_4 DB 0
- TQ1 DW 0
- TQ2 DB 0
- TQ3 DB 0
- TQ4 DB 0
+ TOTALPRICE DW VALUE_WORDS DUP(0) ; current order subtotal in sen
+ TAX DB 8 ; percentage, rounded to whole sen separately for each order
  DTP DB 13,10,"TOTAL PRICE : RM$"
- TAXPRICE DW 0
- SALESQTY DW 0,0,0,0,0 ;SUM TOGETHER TO COMPARE WHETHER GREATER THAN 1000 (REACH THE LIMIT OF 16 BITS CALCULATIONFOR PRICE *QTY)
+ TAXPRICE DW VALUE_WORDS DUP(0) ; current order tax in sen
+ ; Contiguous ledger: no strings, scratch space, or padding between these
+ ; five declarations. RECORD_ORDER copies it as a single block.
+ ; Each value uses [0]=low, [2]=middle, [4]=high word; no signed arithmetic.
+ SALESQTY DW FLAVOUR_COUNT * VALUE_WORDS DUP(0)
+ SALESREVENUE DW FLAVOUR_COUNT * VALUE_WORDS DUP(0) ; sen
+ TOTALSALESQTY DW VALUE_WORDS DUP(0)
+ TOTALINCOME DW VALUE_WORDS DUP(0) ; subtotal income, excluding tax/rounding
+ TOTALTAX DW VALUE_WORDS DUP(0) ; sum of tax actually charged per order
+ ; Derive staging offsets from labels so moving fields cannot silently
+ ; redirect an update to another total. Current ledger = 39 words/78 bytes.
+ SALES_LEDGER_WORDS EQU ($ - SALESQTY) / 2
+ REVENUE_OFFSET EQU SALESREVENUE - SALESQTY
+ QUANTITY_OFFSET EQU TOTALSALESQTY - SALESQTY
+ INCOME_OFFSET EQU TOTALINCOME - SALESQTY
+ TAX_OFFSET EQU TOTALTAX - SALESQTY
+ PROPOSED_TOTALS DW SALES_LEDGER_WORDS DUP(0)
+ QUANTITY_LIMIT DW 0C9FFH,03B9AH,0 ; 999,999,999
+ MONEY_LIMIT DW 0E7FFH,04876H,0017H ; 99,999,999,999 sen
+ PAYABLE DW VALUE_WORDS DUP(0) ; rounded tax-inclusive current bill
+ FLAVOUR_IDS DB 'DAOGM'
+ FORMAT_WORK DW VALUE_WORDS DUP(0)
+ FORMAT_BUFFER DB 16 DUP(0)
+ FORMAT_WIDTH DB 0
+ FORMAT_DECIMALS DB 0
+ LIMIT_MESSAGE DB 13,10,'SALES LIMIT EXCEEDED. Order not recorded; totals unchanged.$'
+
  CTNPURCHASE DB 13,10,"DO YOU WANT TO CONTINUE PURCHASE ? (Y/N)$"
  MSG_SIGNUP_SUCCESS DB 13,10,"-----------------------"
                     DB 13,10," SIGN UP SUCCESSFULLY "
                     DB 13,10,"----------------------$"
  CTNANSWER DB ?
- TENN DW 10
- CASH DW 0,0,0,0,0
- SEN DW 0,0,0,0,0
- CALCASH DW 0,0,0,0,0
- CALSEN DW 0,0,0,0,0
- S DB 0,0,0,0,0
- PRINTSR DB 13,10,"SALES REPORT:$"
- SR1 DB 13,10,"___________________________________________"
-    DB 13,10, "| FLAVOUR | PRICE | QUANTITY | TOTAL PRICE |"
-    DB 13,10, "|------------------------------------------|"
-    DB 13,10, "|    D    |RM5.80 |   $"
- SR11 DB                                 "   |   $"
- SR111 DB                                              "   |$"
- SR2 DB 13,10, "|    A    |RM4.00 |   $"  
- SR22 DB                                 "   |   $"
- SR222 DB                                              "   |$"
- SR3 DB 13,10, "|    O    |RM4.50 |   $"  
- SR33 DB                                 "   |   $"
- SR333 DB                                              "   |$"
- SR4 DB 13,10, "|    G    |RM5.00 |   $"  
- SR44 DB                                 "   |   $"
- SR444 DB                                              "   |$"
- SR5 DB 13,10, "|    M    |RM4.50 |   $"  
- SR55 DB                                 "   |   $"
- SR555 DB                                              "   |$"
- SR6 DB 13,10, "|------------------------------------------|$"
- PRINTTT DB 13,10,"|                 TOTAL INCOME: $"
- PRINTTT2 DB "   |$"
- SR7 DB 13,10, "|------------------------------------------|$"
- PRINTTTAX DB 13,10,"|                  TOTAL TAXES: $"
- PRINTTTAX2 DB "     |$"
- SR8 DB 13,10, "|------------------------------------------|$"
- TOTALCASH DW 0
- TOTALSEN DW 0
- DISPLAYSEN DB 0
- DISPLAYCASH DW 0
- TEMPDATA DB 0
- CT1 DB 0
- CT2 DB 0
- CT3 DB 0
- CR_1 DB 0
- CR_2 DB 0
- CR_3 DB 0
- RETURN_FLAG DB 0
+; ---- Sales report strings; rows are 54 columns including borders ------
+ PRINTSR DB 13,10,'SALES REPORT:$'
+ REPORT_HEADER DB 13,10,'------------------------------------------------------'
+               DB 13,10,'| FLAVOUR | PRICE  |  QUANTITY | TOTAL PRICE (RM)    |'
+               DB 13,10,'------------------------------------------------------$'
+ REPORT_D DB 13,10,'|    D    | RM5.80 | $'
+ REPORT_A DB 13,10,'|    A    | RM4.00 | $'
+ REPORT_O DB 13,10,'|    O    | RM4.50 | $'
+ REPORT_G DB 13,10,'|    G    | RM5.00 | $'
+ REPORT_M DB 13,10,'|    M    | RM4.50 | $'
+ REPORT_ROWS DW OFFSET REPORT_D,OFFSET REPORT_A,OFFSET REPORT_O,OFFSET REPORT_G,OFFSET REPORT_M
+ REPORT_SEPARATOR DB ' |        $'
+ REPORT_END_ROW DB ' |$'
+ REPORT_LINE DB 13,10,'------------------------------------------------------$'
+ REPORT_QTY_LABEL DB 13,10,'|                       TOTAL QUANTITY: $'
+ REPORT_INCOME_LABEL DB 13,10,'|                    TOTAL INCOME (RM): $'
+ REPORT_TAX_LABEL DB 13,10,'|                     TOTAL TAXES (RM): $'
+; ---- Admin controls and password-validation flags --------------------
+ RETURN_FLAG DB 0 ; CAL_TAXNTOTAL result: 0=pending, 1=menu, 2=login
  MSG_MENU_ADMIN DB 13,10," -----------------------------"
                 DB 13,10,"|  CODE  |      FUNCTION      |"
                 DB 13,10,"|   1    |   SALES REPORT     |"
@@ -223,26 +199,21 @@ ENDM
  START_N_STOP_P DB 1
  MSG_PURCHASEOPEN DB 13,10,"PURCHASE NOW IS AVAILABLE!$"
  MSG_PURCHASECLOSE DB 13,10,"PURCHASE NOW IS NOT AVAILABLE!$"
- TAXCASH DW 0
- ROUNDUPTAX DB 0
- SPQUANTITY DB 0,0,0,0
- SPPRICE DB 0,0,0,0,0,0,0,0
- SPSUBPRICE DB 0,0,0,0,0,0,0
- SPTAXP DB 0,0,0,0,0,0
  B_VLENGTH DB 0
  B_VUC DB 0
  B_VLC DB 0
  B_VSC DB 0
  B_VNUM DB 0
- B_VALID_GE0 DB 0
  ;COLOR ANSI
  ;REFERENCE https://gist.github.com/fnky/458719343aabd01cfb17a3a4f7296797
  LIGHT_AQUA 		DB 27, "[0;36m$"   	; ANSI escape sequence for Light aqua text
  RED				DB 27, "[0;31m$"	
  GREEN   			DB 27, "[0;32m$"
- YELLOW 			DB 27, "[0;33m$"
  DEFAULT_COLOR 	DB 27, "[0m$"  		; ANSI escape sequence for default colour
 .CODE
+; ---- Startup, login/signup, and credential handling -------------------
+; MAIN initializes DS, transforms stored credentials once, and dispatches
+; login/signup, user ordering, and admin controls. Totals live until exit.
 MAIN PROC FAR
     MOV AX, @DATA
     MOV DS, AX
@@ -375,6 +346,8 @@ END_MAIN:
     INT 21H
 
 MAIN ENDP
+; Read a username into ENTERED_U (up to 15 printable characters + '$').
+; Escape sets JUMP=1; SI is the entered length used by signup validation.
     GET_E_U PROC
         U_LOGIN_U:;ENTER LOGIN PAGE
         ;--- CLEAR ERROR VALIDATION FROM PREVIOUS VALIDATION FOR MENU INPUT 
@@ -467,6 +440,8 @@ MAIN ENDP
             MOV ENTERED_U[SI],'$'
             RET
 GET_E_U ENDP    
+; Read/mask ENTERED_P, with Escape/backspace support. Signup additionally
+; calls SIGNUP_VALIDATION; login accepts the existing stored credentials.
 GET_E_P PROC
         U_LOGIN_P:;ENTER LOGIN PAGE
         ;--- CLEAR ERROR VALIDATION FROM PREVIOUS VALIDATION FOR MENU INPUT 
@@ -545,6 +520,8 @@ GET_E_P PROC
         
             RET
 GET_E_P ENDP
+; Apply the legacy rotate/XOR credential transform to ENTERED_U/ENTERED_P.
+; Match the transform in LOCK_ENCRYPTION_U/A before VALIDATION_UIDP.
 ENCRYPTION_P PROC
         MOV ENCRYTION_TIMES,10
         ENCRYP_SL:
@@ -579,6 +556,7 @@ ENCRYPTION_P PROC
         END_ENCRY_PROC:
             RET      
 ENCRYPTION_P ENDP
+; Inverse credential-transform helper; retained, but not called by menus.
 DECRYPTION_P PROC
         MOV ENCRYTION_TIMES,10
         DECRYP_SL:
@@ -614,6 +592,7 @@ DECRYPTION_P PROC
         END_DECRYP_PROC:
         RET
 DECRYPTION_P ENDP   
+; Run the five password checks, then display whichever requirements failed.
 SIGNUP_VALIDATION PROC
     ;--------------------------------------------------------------------
         SIGNUP_VALIDATION_P:
@@ -666,6 +645,7 @@ PROMPT_EMSG_TO PROC
     PRINTSTRING DEFAULT_COLOR
     RET
 PROMPT_EMSG_TO ENDP
+; Startup-only transform of USER_U/USER_P (MAIN calls once before login).
 LOCK_ENCRYPTION_U PROC
         MOV ENCRYTION_TIMES,10
         ENCRYP_SL_U:
@@ -700,6 +680,7 @@ LOCK_ENCRYPTION_U PROC
         END_ENCRY_PROC_U:
             RET      
 LOCK_ENCRYPTION_U ENDP
+; Startup-only transform of ADMIN_U/ADMIN_P; same algorithm as user/input.
 LOCK_ENCRYPTION_A PROC
         MOV ENCRYTION_TIMES,10
         ENCRYP_SL_A:
@@ -734,6 +715,7 @@ LOCK_ENCRYPTION_A PROC
         END_ENCRY_PROC_A:
             RET      
 LOCK_ENCRYPTION_A ENDP
+; SI=input password length. Set five B_V* flags and T_ERROR=number passed.
 VALIDATION_P_SIGNUP PROC
     MOV CX,16
     MOV DI,0
@@ -850,6 +832,7 @@ CLEAR_P_PROC PROC; FOR PASSWORD VALIDATION
 
             RET
 CLEAR_P_PROC ENDP
+; Compare transformed credentials. TYPE_LOG_IN: 0=invalid, 1=admin, 2=user.
 VALIDATION_UIDP PROC
     ;;- VALIDATION FOR PASSWORD
     V_UIDA_SL:
@@ -907,6 +890,7 @@ VALIDATION_UIDP PROC
     END_VALIDATION_UIDP:
         RET
 VALIDATION_UIDP ENDP
+; Signup replaces the one in-memory user credential pair; no disk storage.
 MOVE_UP_USER PROC
     MOV CX,16
     MOV SI,0
@@ -919,7 +903,12 @@ MOVE_UP_USER PROC
     LOOP MOVE_NEW_UIDP
     RET
 MOVE_UP_USER ENDP
-USER_INTERFACE_P PROC  
+; ---- User ordering ---------------------------------------------------
+; Reads flavour and two quantity digits, validates 01-10, then calculates
+; one order. RETURN_FLAG from CAL_TAXNTOTAL selects menu or login.
+; Uses AX/BX/CX/DX/SI/DI/BP and flags as scratch; preserves DS/ES/SS.
+USER_INTERFACE_P PROC
+    MOV BOOL,"F" ; No invalid flavour has been entered yet
     CMP START_N_STOP_P,1; CHECK WHERETHER ADMIN WAN TO TO ORDER ANOT
     JE MENUOUTPUT ; IF ADMIN WAN TO ORDER
     JMP ADMIN_DWOP
@@ -930,7 +919,7 @@ MENUOUTPUT:
     CLS; CLEAR SCREEN
     RESETPOSITION ;RESET POSITION
     PRINTSTRING USER_INTERFACE_MENU
-    MOV  BOOL,"T"
+
 
  PRINTSTRING MENU
 
@@ -947,13 +936,14 @@ ERRORMSG:
  JMP MENU_ASK
 
 MENU_ASK:
+ MOV BOOL,"F" ; Clear the error after displaying it
 ;--OUTPUT STRING FOR MENUASK
  PRINTSTRING MENUASK
  INPUTBYTE
  MOV FLAVOURCODE,AL
  JMP VALIDATION_FC; VALIDATION FOOD CODE
 VALIDATION_FC:
-;--COMPARE CODE
+; Normalize ASCII a-z only; punctuation still reaches invalid-code handling.
  CMP FLAVOURCODE,"a"
  JGE CHECKFCRANGE
  JL CHECKFLAVOURCODE
@@ -1026,7 +1016,7 @@ QTY:
  JMP QUANTITY_VALIDATION
 
 QUANTITY_VALIDATION:
-;--QUANTITY VALIDATION
+; Accept exactly 01..09 or 10 before allowing arithmetic or ledger updates.
  CMP QTY1,"0"
  JL QERROR
  JE V_QTY0_SD
@@ -1045,40 +1035,20 @@ QUANTITY_VALIDATION:
   JLE VALID_QTY
 VALID_QTY:
  CALL CAL_QTY_UI
-FOURDGCAL TOTALPRICE
-
-;--9)CONVERT DEC TO HEX
- ADD Q2,30H
- ADD R2,30H
- ADD Q3,30H
- ADD R3,30H
  JMP DISPLAY_PRICE_UI
 
 MENUOUTPUT_CONNECTION:
  JMP MENUOUTPUT
 DISPLAY_PRICE_UI:
-;--OUTPUT PRICE STRING
  PRINTSTRING DISPLAYPRICE
-
-;--OUTPUT BYTE(Q2)
- OUTPUTBYTE Q2
-
-;--OUTPUT BYTE(R2)
- OUTPUTBYTE R2
-
-;--OUTPUT BYTE(".")
- OUTPUTBYTE "."
-
-;--OUTPUT BYTE(Q3)
- OUTPUTBYTE Q3
-
-;--OUTPUT BYTE(R3)
- OUTPUTBYTE R3
+ LEA SI,TOTALPRICE
+ MOV CX,FORMAT_MONEY ; zero field width: no leading padding
+ CALL PRINT_UNSIGNED48
 
 CALL CAL_TAXNTOTAL
- CMP RETURN_FLAG,1
+ CMP RETURN_FLAG,RETURN_TO_MENU
  JE MENUOUTPUT_CONNECTION
- CMP RETURN_FLAG,2
+ CMP RETURN_FLAG,RETURN_TO_LOGIN
  JE END_USER_INTERFACE
 
 ;ADMIN DONT WAN TO OPEN PURCHASE
@@ -1093,999 +1063,326 @@ USER_INTERFACE_P ENDP
 
 
 
+; ---- Sales report and unsigned multiword helpers ---------------------
+; SALESREPORT reads recorded totals, never recomputes revenue or tax.
+; Uses AX/BX/CX/DX/SI/BP and flags as scratch; preserves DI/DS/ES/SS.
 SALESREPORT PROC
     RESETPOSITION
     CLS
     RESETPOSITION
-;PRINT SALES REPORT----------------------------------------------------------------------------------------------------------------------------
- PRINTSTRING PRINTSR ;PRINT(SALES REPORT:)
-;DURIAN-----------------------------------------------------------------------------
- ;PRINT(QUANTITY OF DURIAN ICE-CREAM SOLD:)
- PRINTSTRING SR1
- ;TURN SALESQTY[0] INTO BYTE TO PRINT BYTES USING DIVISION
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,SALESQTY[0] ;AX=0088
- DIV HUNDRED ;AX=0000 DX=0088
- MOV CT1,AL ;CT1=00
- MOV CR_1,DL ;CR_1=88
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,CT1 ;AL=00
- DIV TEN ;AL=00 AH=00
- MOV CT2,AL ;CT2=00
- MOV CR_2,AH ;CR_2=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,CR_1 ;AL=88
- DIV TEN ;AL=08 AH=08
- MOV CT3,AL ;CT3=08
- MOV CR_3,AH ;CR_3=08
-
-;CONVERT QUANTITY FROM DEC TO HEX
- ADD CT2,30H
- ADD CR_2,30H
- ADD CT3,30H
- ADD CR_3,30H
-;OUTPUT BYTE(QUANTITY)
- MOV AL,CT2
- MOV SPQUANTITY[0],AL
- MOV AL,CR_2
- MOV SPQUANTITY[1],AL
- MOV AL,CT3
- MOV SPQUANTITY[2],AL
- MOV AL,CR_3
- MOV SPQUANTITY[3],AL
- CALL PRINTQUANT_SP
-
-
-;CALCULATION OF TOTAL PRICE OF DURIAN
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,ARRAYOFPRICE[0] ;AX=0580
- DIV HUNDRED ;AX=O005 DX=0080
- MOV CASH[0],AX ;CASH[0]=5
- MOV SEN[0],DX ;SEN[0]=80
- MOV AX,SALESQTY[0] ;AX=1000
- MUL CASH[0] ;AX=5*1000=5000
- MOV CALCASH[0],AX ;CALCASH[0]=5000
-
- ;-SEN CALCULATION
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,SEN[0] ;AX=0080
- DIV TENN ;AX=0008 DX=0000
- MOV SEN[0],AX ;SEN[0]=8
- MOV AX,SALESQTY[0] ;AX=1000
- MUL SEN[0] ;AX=8000
- MOV CALSEN[0],AX ;CALSEN[0]=8000
- DIV TENN ;AX=0800 DX=0000
- ADD AX,CALCASH[0] ;AX=800+5000=5800
- MOV CALCASH[0],AX ;CALCASH=[0]=5800
- MOV S[0],DL ;S1=0
-
- ;-SEPARATE VALUE IN BYTE
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,CALCASH[0] ;AX=5800
- DIV HUNDRED ; AX=0058 DX=0000
- MOV Q1,AL ;Q1=58
- MOV R1,DL ;R1=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,Q1 ;AL=58
- DIV TEN ;AL=05 AH=08
- MOV Q2,AL ;Q2=05
- MOV R2,AH ;R2=08
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,R1 ;AL=88
- DIV TEN ;AL=08 AH=08
- MOV Q3,AL ;Q3=08
- MOV R3,AH ;R3=08
-
- ;CONVERT DEC TO HEX
- ADD Q2,30H
- ADD R2,30H
- ADD Q3,30H
- ADD R3,30H
- ADD S[0],30H
-
- PRINTSTRING SR11 ;PRINT(, TOTAL PRICE OF DURIAN ICE-CREAM SOLD : RM)
-
- ;OUTPUT BYTE
- MOV AL,Q2
- MOV SPSUBPRICE[0],AL
- MOV AL,R2
- MOV SPSUBPRICE[1],AL
- MOV AL,Q3
- MOV SPSUBPRICE[2],AL
- MOV AL,R3
- MOV SPSUBPRICE[3],AL
- MOV AL,"."
- MOV SPSUBPRICE[4],AL
- MOV AL,S[0]
- MOV SPSUBPRICE[5],AL
- MOV AL,"0"
- MOV SPSUBPRICE[6],AL
- ;OUTPUTBYTE Q2
- ;OUTPUTBYTE R2
- ;OUTPUTBYTE Q3
- ;OUTPUTBYTE R3
- ;OUTPUTBYTE "."
- ;OUTPUTBYTE S[0]
- ;OUTPUTBYTE "0"
- CALL PRINTPRICE_SUBTP
-
- PRINTSTRING SR111
-
-;APPLE-----------------------------------------------------------------------------
-PRINTSTRING SR2 ;PRINT(QUANTITY OF APPLE ICE-CREAM SOLD:)
- ;TURN SALESQTY[0] INTO BYTE TO PRINT BYTES USING DIVISION
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,SALESQTY[2] ;AX=0099
- DIV HUNDRED ;AX=0000 DX=0099
- MOV CT1,AL ;CT1=00
- MOV CR_1,DL ;CR_1=99
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,CT1 ;AL=00
- DIV TEN ;AL=00 AH=00
- MOV CT2,AL ;CT2=00
- MOV CR_2,AH ;CR_2=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,CR_1 ;AL=99
- DIV TEN ;AL=09 AH=09
- MOV CT3,AL ;CT3=09
- MOV CR_3,AH ;CR_3=09
-
-;CONVERT QUANTITY FROM DEC TO HEX
- ADD CT2,30H
- ADD CR_2,30H
- ADD CT3,30H
- ADD CR_3,30H
-
- ;OUTPUT BYTE(QUANTITY)
- MOV AL,CT2
- MOV SPQUANTITY[0],AL
- MOV AL,CR_2
- MOV SPQUANTITY[1],AL
- MOV AL,CT3
- MOV SPQUANTITY[2],AL
- MOV AL,CR_3
- MOV SPQUANTITY[3],AL
- CALL PRINTQUANT_SP
-
-;CALCULATION OF TOTAL PRICE OF APPLE
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,ARRAYOFPRICE[2] ;AX=0400
- DIV HUNDRED ;AX=O004 DX=0000
- MOV CASH[2],AX ;CASH[0]=4
- MOV SEN[2],DX ;SEN[0]=00
- MOV AX,SALESQTY[2] ;AX=99
- MUL CASH[2] ;AX=99*4=396
- MOV CALCASH[2],AX ;CALCASH[0]=396
-
- ;-SEN CALCULATION
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,SEN[2] ;AX=0080
- DIV TEN ;AX=0008 DX=0000
- MOV SEN[2],AX ;SEN[0]=0
- MOV AX,SALESQTY[2] ;AX=1000
- MUL SEN[2] ;AX=0000
- MOV CALSEN[2],AX ;CALSEN[0]=0000
- DIV TENN ;AX=0000 DX=0000
- ADD AX,CALCASH[2] ;AX=000+0396=0396
- MOV CALCASH[2],AX ;CALCASH=[0]=0396
- MOV S[1],DL ;S1=0
-
- ;-SEPARATE VALUE IN BYTE
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,CALCASH[2] ;AX=0396
- DIV HUNDRED ; AX=0003 DX=0096
- MOV Q1,AL ;Q1=03
- MOV R1,DL ;R1=96
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,Q1 ;AL=03
- DIV TEN ;AL=03 AH=00
- MOV Q2,AL ;Q2=03
- MOV R2,AH ;R2=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,R1 ;AL=96
- DIV TEN ;AL=09 AH=06
- MOV Q3,AL ;Q3=09
- MOV R3,AH ;R3=06
-
- ;CONVERT DEC TO HEX
- ADD Q2,30H
- ADD R2,30H
- ADD Q3,30H
- ADD R3,30H
- ADD S[1],30H
-
-
- PRINTSTRING SR22 ;PRINT(, TOTAL PRICE OF APPLE ICE-CREAM SOLD : RM)
-
- ;OUTPUT BYTE
- MOV AL,Q2
- MOV SPSUBPRICE[0],AL
- MOV AL,R2
- MOV SPSUBPRICE[1],AL
- MOV AL,Q3
- MOV SPSUBPRICE[2],AL
- MOV AL,R3
- MOV SPSUBPRICE[3],AL
- MOV AL,"."
- MOV SPSUBPRICE[4],AL
- MOV AL,S[0]
- MOV SPSUBPRICE[5],AL
- MOV AL,"0"
- MOV SPSUBPRICE[6],AL
- ;OUTPUTBYTE Q2
- ;OUTPUTBYTE R2
- ;OUTPUTBYTE Q3
- ;OUTPUTBYTE R3
- ;OUTPUTBYTE "."
- ;OUTPUTBYTE S[0]
- ;OUTPUTBYTE "0"
- CALL PRINTPRICE_SUBTP
-
- PRINTSTRING SR222
-;ORANGE-----------------------------------------------------------------------------
-
-PRINTSTRING SR3 ;PRINT(QUANTITY OF ORANGE ICE-CREAM SOLD:)
- ;TURN SALESQTY[0] INTO BYTE TO PRINT BYTES USING DIVISION
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,SALESQTY[4] ;AX=0888
- DIV HUNDRED ;AX=0008 DX=0088
- MOV CT1,AL ;CT1=08
- MOV CR_1,DL ;CR_1=88
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,CT1 ;AL=08
- DIV TEN ;AL=08 AH=00
- MOV CT2,AL ;CT2=08
- MOV CR_2,AH ;CR_2=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,CR_1 ;AL=88
- DIV TEN ;AL=08 AH=08
- MOV CT3,AL ;CT3=08
- MOV CR_3,AH ;CR_3=08
-
-;CONVERT QUANTITY FROM DEC TO HEX
- ADD CT2,30H
- ADD CR_2,30H
- ADD CT3,30H
- ADD CR_3,30H
-
- ;OUTPUT BYTE(QUANTITY)
- MOV AL,CT2
- MOV SPQUANTITY[0],AL
- MOV AL,CR_2
- MOV SPQUANTITY[1],AL
- MOV AL,CT3
- MOV SPQUANTITY[2],AL
- MOV AL,CR_3
- MOV SPQUANTITY[3],AL
- CALL PRINTQUANT_SP
-
-;CALCULATION OF TOTAL PRICE OF ORANGE
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,ARRAYOFPRICE[4] ;AX=0450
- DIV HUNDRED ;AX=O004 DX=0050
- MOV CASH[4],AX ;CASH[0]=4
- MOV SEN[4],DX ;SEN[0]=50
- MOV AX,SALESQTY[4] ;AX=1000
- MUL CASH[4] ;AX=4*1000=4000
- MOV CALCASH[4],AX ;CALCASH[0]=4000
-
- ;-SEN CALCULATION
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,SEN[4] ;AX=0050
- DIV TEN ;AX=0005 DX=0000
- MOV SEN[4],AX ;SEN[0]=5
- MOV AX,SALESQTY[4] ;AX=1000
- MUL SEN[4] ;AX=5000
- MOV CALSEN[4],AX ;CALSEN[0]=8000
- DIV TENN ;AX=0500 DX=0000
- ADD AX,CALCASH[4] ;AX=500+5000=4500
- MOV CALCASH[4],AX ;CALCASH=[0]=4500
- MOV S[2],DL ;S1=0
-
- ;-SEPARATE VALUE IN BYTE
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,CALCASH[4] ;AX=4500
- DIV HUNDRED ; AX=0045 DX=0000
- MOV Q1,AL ;Q1=45
- MOV R1,DL ;R1=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,Q1 ;AL=45
- DIV TEN ;AL=04 AH=05
- MOV Q2,AL ;Q2=04
- MOV R2,AH ;R2=05
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,R1 ;AL=00
- DIV TEN ;AL=00 AH=00
- MOV Q3,AL ;Q3=00
- MOV R3,AH ;R3=00
-
- ;CONVERT DEC TO HEX
- ADD Q2,30H
- ADD R2,30H
- ADD Q3,30H
- ADD R3,30H
- ADD S[2],30H
- PRINTSTRING SR33 ;PRINT(, TOTAL PRICE OF ORANGE ICE-CREAM SOLD : RM)
-
- ;OUTPUT BYTE
-MOV AL,Q2
- MOV SPSUBPRICE[0],AL
- MOV AL,R2
- MOV SPSUBPRICE[1],AL
- MOV AL,Q3
- MOV SPSUBPRICE[2],AL
- MOV AL,R3
- MOV SPSUBPRICE[3],AL
- MOV AL,"."
- MOV SPSUBPRICE[4],AL
- MOV AL,S[0]
- MOV SPSUBPRICE[5],AL
- MOV AL,"0"
- MOV SPSUBPRICE[6],AL
- ;OUTPUTBYTE Q2
- ;OUTPUTBYTE R2
- ;OUTPUTBYTE Q3
- ;OUTPUTBYTE R3
- ;OUTPUTBYTE "."
- ;OUTPUTBYTE S[0]
- ;OUTPUTBYTE "0"
- CALL PRINTPRICE_SUBTP
- 
- PRINTSTRING SR333
-;GRAPE-----------------------------------------------------------------------------
-
-PRINTSTRING SR4 ;PRINT(QUANTITY OF GRAPE ICE-CREAM SOLD:)
- ;TURN SALESQTY[0] INTO BYTE TO PRINT BYTES USING DIVISION
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,SALESQTY[6] ;AX=0999
- DIV HUNDRED ;AX=0009 DX=0099
- MOV CT1,AL ;CT1=09
- MOV CR_1,DL ;CR_1=99
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,CT1 ;AL=09
- DIV TEN ;AL=08 AH=00
- MOV CT2,AL ;CT2=09
- MOV CR_2,AH ;CR_2=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,CR_1 ;AL=99
- DIV TEN ;AL=09 AH=09
- MOV CT3,AL ;CT3=09
- MOV CR_3,AH ;CR_3=09
-
-;CONVERT QUANTITY FROM DEC TO HEX
- ADD CT2,30H
- ADD CR_2,30H
- ADD CT3,30H
- ADD CR_3,30H
-
- ;OUTPUT BYTE(QUANTITY)
- MOV AL,CT2
- MOV SPQUANTITY[0],AL
- MOV AL,CR_2
- MOV SPQUANTITY[1],AL
- MOV AL,CT3
- MOV SPQUANTITY[2],AL
- MOV AL,CR_3
- MOV SPQUANTITY[3],AL
- CALL PRINTQUANT_SP
-
-;CALCULATION OF TOTAL PRICE OF GRAPE
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,ARRAYOFPRICE[6] ;AX=0500
- DIV HUNDRED ;AX=O005 DX=0000
- MOV CASH[6],AX ;CASH[0]=5
- MOV SEN[6],DX ;SEN[0]=00
- MOV AX,SALESQTY[6] ;AX=1000
- MUL CASH[6] ;AX=5*1000=5000
- MOV CALCASH[6],AX ;CALCASH[0]=5000
-
- ;-SEN CALCULATION
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,SEN[6] ;AX=0000
- DIV TEN ;AX=0000 DX=0000
- MOV SEN[6],AX ;SEN[0]=0
- MOV AX,SALESQTY[6] ;AX=1000
- MUL SEN[6] ;AX=0000
- MOV CALSEN[6],AX ;CALSEN[0]=0000
- DIV TENN ;AX=0000 DX=0000
- ADD AX,CALCASH[6] ;AX=0000+5000=5000
- MOV CALCASH[6],AX ;CALCASH=[0]=5000
- MOV S[3],DL ;S1=0
-
- ;-SEPARATE VALUE IN BYTE
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,CALCASH[6] ;AX=5000
- DIV HUNDRED ; AX=0050 DX=0000
- MOV Q1,AL ;Q1=50
- MOV R1,DL ;R1=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,Q1 ;AL=50
- DIV TEN ;AL=05 AH=00
- MOV Q2,AL ;Q2=05
- MOV R2,AH ;R2=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,R1 ;AL=00
- DIV TEN ;AL=00 AH=00
- MOV Q3,AL ;Q3=00
- MOV R3,AH ;R3=00
-
- ;CONVERT DEC TO HEX
- ADD Q2,30H
- ADD R2,30H
- ADD Q3,30H
- ADD R3,30H
- ADD S[3],30H
-
- PRINTSTRING SR44 ;PRINT(, TOTAL PRICE OF GRAPE ICE-CREAM SOLD : RM)
-
- ;OUTPUT BYTE
-MOV AL,Q2
- MOV SPSUBPRICE[0],AL
- MOV AL,R2
- MOV SPSUBPRICE[1],AL
- MOV AL,Q3
- MOV SPSUBPRICE[2],AL
- MOV AL,R3
- MOV SPSUBPRICE[3],AL
- MOV AL,"."
- MOV SPSUBPRICE[4],AL
- MOV AL,S[0]
- MOV SPSUBPRICE[5],AL
- MOV AL,"0"
- MOV SPSUBPRICE[6],AL
- ;OUTPUTBYTE Q2
- ;OUTPUTBYTE R2
- ;OUTPUTBYTE Q3
- ;OUTPUTBYTE R3
- ;OUTPUTBYTE "."
- ;OUTPUTBYTE S[0]
- ;OUTPUTBYTE "0"
- CALL PRINTPRICE_SUBTP
- 
-PRINTSTRING SR444
-
-;MANGO-----------------------------------------------------------------------------
-PRINTSTRING SR5 ;PRINT(QUANTITY OF GRAPE ICE-CREAM SOLD:)
- ;TURN SALESQTY[0] INTO BYTE TO PRINT BYTES USING DIVISION
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,SALESQTY[8] ;AX=1000
- DIV HUNDRED ;AX=0010 DX=0000
- MOV CT1,AL ;CT1=10
- MOV CR_1,DL ;CR_1=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,CT1 ;AL=10
- DIV TEN ;AL=01 AH=00
- MOV CT2,AL ;CT2=01
- MOV CR_2,AH ;CR_2=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,CR_1 ;AL=00
- DIV TEN ;AL=00 AH=00
- MOV CT3,AL ;CT3=00
- MOV CR_3,AH ;CR_3=00
-
-;CONVERT QUANTITY FROM DEC TO HEX
- ADD CT2,30H
- ADD CR_2,30H
- ADD CT3,30H
- ADD CR_3,30H
-
- ;OUTPUT BYTE(QUANTITY)
- MOV AL,CT2
- MOV SPQUANTITY[0],AL
- MOV AL,CR_2
- MOV SPQUANTITY[1],AL
- MOV AL,CT3
- MOV SPQUANTITY[2],AL
- MOV AL,CR_3
- MOV SPQUANTITY[3],AL
- CALL PRINTQUANT_SP
-
-;CALCULATION OF TOTAL PRICE OF MANGO
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,ARRAYOFPRICE[8] ;AX=0450
- DIV HUNDRED ;AX=O004 DX=0050
- MOV CASH[8],AX ;CASH[8]=4
- MOV SEN[8],DX ;SEN[8]=50
- MOV AX,SALESQTY[8] ;AX=1000
- MUL CASH[8] ;AX=4*1000=4000
- MOV CALCASH[8],AX ;CALCASH[8]=4000
-
- ;-SEN CALCULATION
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,SEN[8] ;AX=0050
- DIV TEN ;AX=0005 DX=0000
- MOV SEN[8],AX ;SEN[0]=5
- MOV AX,SALESQTY[8] ;AX=1000
- MUL SEN[8] ;AX=5000
- MOV CALSEN[8],AX ;CALSEN[0]=5000
- DIV TENN ;AX=0500 DX=0000
- ADD AX,CALCASH[8] ;AX=0500+4000=4500
- MOV CALCASH[8],AX ;CALCASH=[0]=4500
- MOV S[4],DL ;S1=0
-
- ;-SEPARATE VALUE IN BYTE
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AX,CALCASH[8] ;AX=4500
- DIV HUNDRED ; AX=0045 DX=0000
- MOV Q1,AL ;Q1=45
- MOV R1,DL ;R1=00
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,Q1 ;AL=45
- DIV TEN ;AL=04 AH=05
- MOV Q2,AL ;Q2=04
- MOV R2,AH ;R2=05
-
- MOV AX,0 ;AX=0000
- MOV DX,0 ;DX=0000
- MOV AL,R1 ;AL=00
- DIV TEN ;AL=00 AH=00
- MOV Q3,AL ;Q3=00
- MOV R3,AH ;R3=00
-
- ;CONVERT DEC TO HEX
- ADD Q2,30H
- ADD R2,30H
- ADD Q3,30H
- ADD R3,30H
- ADD S[4],30H
- 
- PRINTSTRING SR55 ;PRINT(, TOTAL PRICE OF MANGO ICE-CREAM SOLD : RM)
-
- ;OUTPUT BYTE
- MOV AL,Q2
- MOV SPSUBPRICE[0],AL
- MOV AL,R2
- MOV SPSUBPRICE[1],AL
- MOV AL,Q3
- MOV SPSUBPRICE[2],AL
- MOV AL,R3
- MOV SPSUBPRICE[3],AL
- MOV AL,"."
- MOV SPSUBPRICE[4],AL
- MOV AL,S[0]
- MOV SPSUBPRICE[5],AL
- MOV AL,"0"
- MOV SPSUBPRICE[6],AL
- ;OUTPUTBYTE Q2
- ;OUTPUTBYTE R2
- ;OUTPUTBYTE Q3
- ;OUTPUTBYTE R3
- ;OUTPUTBYTE "."
- ;OUTPUTBYTE S[0]
- ;OUTPUTBYTE "0"
- CALL PRINTPRICE_SUBTP
- 
- PRINTSTRING SR555
- PRINTSTRING SR6
-
-;-------------TOTAL------------------------------------------------------------------------------------------------------------------------
- MOV AL,S[0]
- SUB AL,30H
- MOV S[0],AL
- MOV AL,S[1]
- SUB AL,30H
- MOV S[1],AL
- MOV AL,S[2]
- SUB AL,30H
- MOV S[2],AL
- MOV AL,S[3]
- SUB AL,30H
- MOV S[3],AL
- MOV AL,S[4]
- SUB AL,30H; HERE MISSING 3 JN 0H
- MOV S[4],AL
-
- ;-DISPLAY SEN CALCULATION
- MOV AX,0
- MOV DX,0
- MOV AL,S[0]
- ADD AL,S[1]
- ADD AL,S[2]
- ADD AL,S[3]
- ADD AL,S[4]
- DIV TEN ;EXP: AL=05 AH=06
- MOV DISPLAYSEN,AH ;DISPLAYSEN=6
- MOV AH,0
- MOV TEMPDATA,AL
-
- ;DISPLAY CASH CALCULATION
- MOV AX,0
- ADD AL,TEMPDATA
- ADD AX,CALCASH[0]
- ADD AX,CALCASH[2]
- ADD AX,CALCASH[4]
- ADD AX,CALCASH[6]
- ADD AX,CALCASH[8]
- MOV DISPLAYCASH,AX
-
-  ;CONVERT DISPLAYCASH INTO BYTES FOR OUTPUT PURPOSE USING DIVISION
-  MOV AX,0
-  MOV DX,0
-  MOV AX,DISPLAYCASH ;EXP:12345
-  DIV HUNDRED ;AX=0123 DX=0045
-  MOV TQ1,AX ;TQ1=123
-  MOV TR1,DX ;R1=45
-;
-  MOV AX,0
-  MOV DX,0
-  MOV AX,TQ1 ;AX=0123
-  DIV HUNDRED ;AX=0001 DX=0023
-  MOV Q2,AL ;Q2=1 -------------------------
-  MOV R2,DL ;R2=23
-;
-  MOV AX,0
-  MOV DX,0
-  MOV AL,R2 ;AL=23
-  DIV TEN ;AL=02 AH=03
-  MOV Q3,AL ;Q3=02 -------------------------
-  MOV R3,AH ;R3=03 -------------------------
-;
-  MOV AX,0
-  MOV DX,0
-  MOV AX,TR1 ;AL=45
-  DIV TENN ;AX=0004 DX=0005
-  MOV Q4,AL ;Q4=04 -------------------------
-  MOV R4,DL ;R4=05 -------------------------
-  
-  ;CONVERT DEC TO HEX
-  MOV AX,0
-  MOV DX,0
-  ADD Q2,30H
-  ADD Q3,30H
-  ADD R3,30H
-  ADD Q4,30H
-  ADD R4,30H
-  ADD DISPLAYSEN,30H
-;
-  PRINTSTRING PRINTTT ;OUTPUT TOTAL INCOME
-
-  MOV AL,Q2
-  MOV SPPRICE[0],AL
-  MOV AL,Q3
-  MOV SPPRICE[1],AL
-  MOV AL,R3
-  MOV SPPRICE[2],AL
-  MOV AL,Q4
-  MOV SPPRICE[3],AL
-  MOV AL,R4
-  MOV SPPRICE[4],AL
-  MOV AL,"."
-  MOV SPPRICE[5],AL
-  MOV AL,DISPLAYSEN
-  MOV SPPRICE[6],AL
-  MOV AL,"0"
-  MOV SPPRICE[7],AL
-  CALL PRINTPRICE_SP
-
-  ;OUTPUTBYTE Q2
-  ;OUTPUTBYTE Q3
-  ;OUTPUTBYTE R3
-  ;OUTPUTBYTE Q4
-  ;OUTPUTBYTE R4
-  ;OUTPUTBYTE "."
-  ;OUTPUTBYTE DISPLAYSEN
-  ;OUTPUTBYTE "0"
-  PRINTSTRING PRINTTT2
-  PRINTSTRING SR7
-
-;-----------------------------------------------------TOTAL TAXES---------------------------------------------------------------------------
- ;EXP:999*5.8(DURIAN)=5794.2
- ;SEN OF TOTAL TAX CALCULATION
- MOV AX,0
- MOV DX,0
- MOV AL,DISPLAYSEN ;AX=0002
- MUL TAXDW ;2*8=16
- DIV HUNDRED ;16/100 AL=0,AH=16/AX=1600
- DIV THOUSAND ;1600/1000 AX=0001 DX=0600
- MOV ROUNDUPTAX,AL
-
- ;CASH OF TOTAL TAX CALCULATION
- MOV AX,0
- MOV DX,0
- MOV AX,DISPLAYCASH ;AX=5794
- MUL TAXDW ;5794*8-46352
- DIV HUNDRED ;46352/100 AX=0463 DX=0052
- MOV TQ1,AX ;TQ1=463
- MOV R1,DL ;R1=52
-
- MOV AX,0
- MOV DX,0
- MOV AX,TQ1 ;AX=0463
- DIV HUNDRED ;AX=0004 DX=0063
- MOV Q2,AL ;Q2=4 --------------------
- MOV R2,DL ;R2=63
-
- MOV AX,0
- MOV DX,0
- MOV AL,R2 ;AL=63
- DIV TEN ;AL=06 AH=03
- MOV Q3,AL ;Q3=6 --------------------
- MOV R3,AH ;R3=3 --------------------
-
- MOV AX,0
- MOV DX,0
- MOV AL,R1 ;AL=52
- DIV TEN ;AL=05 AH=02
- MOV Q4,AL ;Q3=5 --------------------
- MOV R4,AH ;R3=2 --------------------
- 
- ;ADD WITH SEN ROUNDUP
- MOV AL,R4 ;AL=2
- ADD AL,ROUNDUPTAX ;2+1=3
- MOV R4,AL
-
- ;COMPARE R4 CHECK WHETHER TO ROUNDUP OR NOT
- CMP R4,4
- JG ROUNDUPTAXCAL
- JLE CONVERTTAX
-
-ROUNDUPTAXCAL:
- MOV AL,Q4
- ADD AL,1
- MOV Q4,AL
-
- ;CONVERT TAX FROM DEC TO HEX
-CONVERTTAX:
- ADD Q2,30H
- ADD Q3,30H
- ADD R3,30H
- ADD Q4,30H
-
- ;OUTPUT TOTAL TAX
- PRINTSTRING PRINTTTAX
- MOV AL,Q2
- MOV SPTAXP[0],AL
- MOV AL,Q3
- MOV SPTAXP[1],AL
- MOV AL,R3
- MOV SPTAXP[2],AL
- MOV AL,"."
- MOV SPTAXP[3],AL
- MOV AL,Q4
- MOV SPTAXP[4],AL
- MOV AL,"0"
- MOV SPTAXP[5],AL
- ;OUTPUTBYTE Q2
- ;OUTPUTBYTE Q3
- ;OUTPUTBYTE R3
- ;OUTPUTBYTE "."
- ;OUTPUTBYTE Q4
- ;OUTPUTBYTE "0"
- CALL PRINTPRICE_TAXP
- PRINTSTRING PRINTTTAX2
- PRINTSTRING SR8
-
- 
-
- RET
+    PRINTSTRING PRINTSR
+    PRINTSTRING REPORT_HEADER
+    XOR BX,BX ; word offset into REPORT_ROWS (string pointers)
+    XOR BP,BP ; VALUE_BYTES offset into each flavour's 48-bit totals
+REPORT_ROW:
+    MOV SI,REPORT_ROWS[BX]
+    MOV DX,SI
+    MOV AH,09H
+    INT 21H
+    LEA SI,SALESQTY
+    ADD SI,BP
+    MOV CX,QUANTITY_COLUMNS
+    CALL PRINT_UNSIGNED48
+    PRINTSTRING REPORT_SEPARATOR
+    LEA SI,SALESREVENUE
+    ADD SI,BP
+    MOV CX,FORMAT_MONEY + MONEY_COLUMNS
+    CALL PRINT_UNSIGNED48
+    PRINTSTRING REPORT_END_ROW
+    ADD BX,2
+    ADD BP,VALUE_BYTES
+    CMP BX,FLAVOUR_COUNT * 2
+    JB REPORT_ROW
+    PRINTSTRING REPORT_LINE
+    PRINTSTRING REPORT_QTY_LABEL
+    LEA SI,TOTALSALESQTY
+    MOV CX,MONEY_COLUMNS ; align total quantity with the money column
+    CALL PRINT_UNSIGNED48
+    PRINTSTRING REPORT_END_ROW
+    PRINTSTRING REPORT_INCOME_LABEL
+    LEA SI,TOTALINCOME
+    MOV CX,FORMAT_MONEY + MONEY_COLUMNS
+    CALL PRINT_UNSIGNED48
+    PRINTSTRING REPORT_END_ROW
+    PRINTSTRING REPORT_TAX_LABEL
+    LEA SI,TOTALTAX
+    MOV CX,FORMAT_MONEY + MONEY_COLUMNS
+    CALL PRINT_UNSIGNED48
+    PRINTSTRING REPORT_END_ROW
+    PRINTSTRING REPORT_LINE
+    RET
 SALESREPORT ENDP
+
+; DS:SI -> value; CL = minimum field width; CH = 0 or 2 decimals.
+; Output: right-aligned text, at least one integer digit; no grouping commas.
+; Preserves general/segment registers, changes flags and FORMAT_* scratch.
+; Shared scratch makes this routine non-reentrant (no nested/interrupt calls).
+; Divide a scratch copy high word first so that
+; DX carries the remainder into the next word. Never divide a whole
+; multiword value into a single 16-bit quotient.
+PRINT_UNSIGNED48 PROC
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+    PUSH DI
+    PUSH BP
+    MOV FORMAT_WIDTH,CL
+    MOV FORMAT_DECIMALS,CH
+    MOV AX,[SI]
+    MOV FORMAT_WORK,AX
+    MOV AX,[SI+2]
+    MOV FORMAT_WORK[2],AX
+    MOV AX,[SI+4]
+    MOV FORMAT_WORK[4],AX
+    MOV BP,1
+    CMP CH,0
+    JE FORMAT_START
+    MOV BP,3 ; money always includes a units digit and two sen digits
+FORMAT_START:
+    LEA DI,FORMAT_BUFFER[15]
+    XOR CX,CX
+    MOV BX,10
+FORMAT_DIGIT:
+    ; DX:AX / 10 is safe at each step: the previous remainder is < 10.
+    ; Save digits backwards; FORMAT_BUFFER holds up to 15 digits for 48 bits.
+    XOR DX,DX
+    MOV AX,FORMAT_WORK[4]
+    DIV BX
+    MOV FORMAT_WORK[4],AX
+    MOV AX,FORMAT_WORK[2]
+    DIV BX
+    MOV FORMAT_WORK[2],AX
+    MOV AX,FORMAT_WORK
+    DIV BX
+    MOV FORMAT_WORK,AX
+    ADD DL,'0'
+    MOV [DI],DL
+    DEC DI
+    INC CX
+    MOV AX,FORMAT_WORK
+    OR AX,FORMAT_WORK[2]
+    OR AX,FORMAT_WORK[4]
+    JNZ FORMAT_DIGIT
+    CMP CX,BP
+    JB FORMAT_DIGIT
+    MOV BX,CX
+    CMP FORMAT_DECIMALS,0
+    JE FORMAT_LENGTH
+    INC BX
+FORMAT_LENGTH:
+    XOR AX,AX
+    MOV AL,FORMAT_WIDTH
+    SUB AX,BX
+    JBE FORMAT_OUTPUT ; no padding if width is zero or smaller than the value
+    MOV BX,AX
+FORMAT_PAD:
+    MOV DL,' '
+    MOV AH,02H
+    INT 21H
+    DEC BX
+    JNZ FORMAT_PAD
+FORMAT_OUTPUT:
+    INC DI
+    CMP FORMAT_DECIMALS,0
+    JE FORMAT_CHARACTER
+    CMP CX,2
+    JNE FORMAT_CHARACTER
+    MOV DL,'.'
+    MOV AH,02H
+    INT 21H
+FORMAT_CHARACTER:
+    MOV DL,[DI]
+    MOV AH,02H
+    INT 21H
+    LOOP FORMAT_OUTPUT
+    POP BP
+    POP DI
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+PRINT_UNSIGNED48 ENDP
+
+; DS:SI -> candidate, DS:DI -> increment, DS:BX -> inclusive limit.
+; CF=1 on overflow or limit exceeded. Only scratch candidates are changed.
+; Clobbers AX/flags; preserves BX/CX/DX/SI/DI/BP and segment registers.
+; Rejected candidates may already be changed: never pass the live ledger.
+ADD_CHECKED48 PROC
+    MOV AX,[DI]
+    ADD [SI],AX
+    MOV AX,[DI+2]
+    ADC [SI+2],AX
+    MOV AX,[DI+4]
+    ADC [SI+4],AX
+    JC ADD48_REJECT
+    MOV AX,[SI+4]
+    CMP AX,[BX+4]
+    JA ADD48_REJECT
+    JB ADD48_ACCEPT
+    MOV AX,[SI+2]
+    CMP AX,[BX+2]
+    JA ADD48_REJECT
+    JB ADD48_ACCEPT
+    MOV AX,[SI]
+    CMP AX,[BX]
+    JA ADD48_REJECT
+ADD48_ACCEPT:
+    CLC
+    RET
+ADD48_REJECT:
+    STC
+    RET
+ADD_CHECKED48 ENDP
+
+; Copy CX words from DS:SI to DS:DI. CX must be positive; no overlapping buffers.
+; Clobbers AX/CX/SI/DI/flags; preserves BX/DX/BP and segment registers.
+; Both operands deliberately use DS: MOVSW would require ES initialization.
+COPY_WORDS_DS PROC
+COPY_WORDS_NEXT:
+    MOV AX,[SI]
+    MOV [DI],AX
+    ADD SI,2
+    ADD DI,2
+    LOOP COPY_WORDS_NEXT
+    RET
+COPY_WORDS_DS ENDP
+
+; Inputs: normalized FLAVOURCODE and TOTALQTY/TOTALPRICE/TAXPRICE from
+; the validated order. Stage -> check all five affected values -> commit.
+; CF=1 rejects with the entire live ledger unchanged; CF=0 records once.
+; Clobbers AX/BX/CX/SI/DI/BP/flags; preserves DX and segment registers.
+RECORD_ORDER PROC
+    LEA SI,SALESQTY
+    LEA DI,PROPOSED_TOTALS
+    MOV CX,SALES_LEDGER_WORDS
+    CALL COPY_WORDS_DS
+    XOR BP,BP
+    XOR BX,BX
+    MOV AL,FLAVOURCODE
+RECORD_FIND_FLAVOUR:
+    CMP AL,FLAVOUR_IDS[BX]
+    JE RECORD_FOUND
+    INC BX
+    ADD BP,VALUE_BYTES
+    CMP BX,FLAVOUR_COUNT
+    JB RECORD_FIND_FLAVOUR
+    JMP RECORD_REJECT
+RECORD_FOUND:
+    ; Flavour quantity and combined quantity use the quantity limit.
+    LEA SI,PROPOSED_TOTALS
+    ADD SI,BP
+    LEA DI,TOTALQTY
+    LEA BX,QUANTITY_LIMIT
+    CALL ADD_CHECKED48
+    JC RECORD_REJECT
+    LEA SI,PROPOSED_TOTALS[QUANTITY_OFFSET]
+    CALL ADD_CHECKED48
+    JC RECORD_REJECT
+    ; Flavour revenue, combined revenue, and charged tax use the sen limit.
+    LEA SI,PROPOSED_TOTALS[REVENUE_OFFSET]
+    ADD SI,BP
+    LEA DI,TOTALPRICE
+    LEA BX,MONEY_LIMIT
+    CALL ADD_CHECKED48
+    JC RECORD_REJECT
+    LEA SI,PROPOSED_TOTALS[INCOME_OFFSET]
+    CALL ADD_CHECKED48
+    JC RECORD_REJECT
+    LEA SI,PROPOSED_TOTALS[TAX_OFFSET]
+    LEA DI,TAXPRICE
+    CALL ADD_CHECKED48
+    JC RECORD_REJECT
+    LEA SI,PROPOSED_TOTALS
+    LEA DI,SALESQTY
+    MOV CX,SALES_LEDGER_WORDS
+    CALL COPY_WORDS_DS
+    CLC
+    RET
+RECORD_REJECT:
+    STC
+    RET
+RECORD_ORDER ENDP
+
+; ---- Per-order calculation and acceptance ----------------------------
+; Inputs: validated ASCII QTY1/QTY2 and PRICE in sen.
+; Outputs: TOTALQTY and TOTALPRICE as three-word unsigned values.
+; Consumes QTY1/QTY2 in place; clobbers AX/DX/flags only.
 CAL_QTY_UI PROC
-;--CLEAR AX
  MOV AX,0
 CALCULATION:
-;--1)CONVERT HEX TO DEC
- SUB QTY1,30H ; QTY1 = 1
- SUB QTY2,30H; QYT2 = 0
+; Convert ASCII decimal digits to their numeric values.
+ SUB QTY1,'0'
+ SUB QTY2,'0'
 
-;--2)MULTIPLY 10 WITH TEN-PLACE
- MOV AL,QTY1 ; AL = 1
- MUL TEN ; AL = 1 *10 = 10
+; Quantity = tens digit * 10 + units digit (maximum 10).
+ MOV AL,QTY1
+ MUL TEN
 
-;--3)MOVE TO REGISTER,THEN TEN-PLACE PLUS WITH ONE-PLACE,THEN MOVE BACK
- ADD AL,QTY2 ; ; AL = 10+ 0 = 10
- MOV TOTALQTY,AL ; TOTALQTY = AL = 10
+ ADD AL,QTY2
+ MOV TOTALQTY,AX ; order input is limited to 01-10
+ MOV TOTALQTY[2],0
+ MOV TOTALQTY[4],0
 
-;--4)MUTIPLY AS WITH PRICE AND STORE AX TO TOTALPRICE
+; The 16-bit unit price multiplication returns its full result in DX:AX.
  MUL PRICE
  MOV TOTALPRICE,AX
+ MOV TOTALPRICE[2],DX ; preserve the full 16x16 multiplication result
+ MOV TOTALPRICE[4],0
 
      RET
 CAL_QTY_UI ENDP
+; Calculate tax/payable, call RECORD_ORDER exactly once, then ask Y/N.
+; Reads current order globals; writes TAXPRICE/PAYABLE and RETURN_FLAG.
+; RETURN_TO_MENU means Y; RETURN_TO_LOGIN means N (also after rejection).
+; Uses AX/BX/CX/DX/SI/DI/BP/flags as scratch; preserves segment registers.
 CAL_TAXNTOTAL PROC
-     MOV RETURN_FLAG,0
-     ;--CALCULATE TAX PRICE
-;--1)MOVE TOTALPRICE TO AX, CALCULATE THE TAX PRICE AND AUTOMATICALLY MOVE QUOTIENT TO AX AND REMAINDER TO DX
- MOV AX,0
- MOV DX,0
- MOV AL,TAX
- MUL TOTALPRICE
+ MOV RETURN_FLAG,0
+ ; Per-order bound: 10 * 580 = 5800 sen. The full DX:AX product
+ ; is retained through tax rounding/division; the quotient fits a word.
+ MOV AX,TOTALPRICE
+ XOR BX,BX
+ MOV BL,TAX
+ MUL BX
+ ADD AX,50 ; tax rounded half-up to the nearest sen
+ ADC DX,0
+ DIV HUNDRED
  MOV TAXPRICE,AX
- DIV THOUSAND
- MOV TQ1,AX ;46 41
- MOV TR1,DX ;400 760
+ MOV TAXPRICE[2],0
+ MOV TAXPRICE[4],0
 
- MOV AX,0
- MOV DX,0
- MOV AX,TQ1 ;46 41
- DIV TEN    ;04 04
- MOV TQ2,AL ;04 04 
- MOV TR2,AH ;06 01
-
- MOV AX,0
- MOV DX,0
- 
- MOV AX,TR1 ;400 760
- DIV HUNDRED ;AL = 04 07
- MOV TQ3,AL ;AL = 04 07
- MOV TR_3,DL ;DL = 00 60
-
- MOV AX,0
- MOV DX,0
- MOV AL,TR_3 ;00 60
- DIV TEN    ;0 06
- MOV TQ4,AL ;0 06
- MOV TR_4,AH ;0 00
- 
-;MOVE TQ3 TO BL TO COMPARE FOR ROUND UP
- MOV BL,TQ3
-
-;--2)CONVERT DEC TO HEX
- ADD TQ2,30H
- ADD TQ3,30H
- ADD TQ4,30H
- ADD TR2,30H
-
-;--3)OUTPUT TAX PRICE
+ ; Round the complete tax-inclusive bill once to the nearest 5 sen.
+ ; Maximum bill is 6264 sen before rounding, 6265 afterwards.
+ ADD AX,TOTALPRICE
+ ADD AX,2
+ XOR DX,DX
+ MOV BX,5
+ DIV BX
+ MUL BX
+ MOV PAYABLE,AX
+ MOV PAYABLE[2],DX
+ MOV PAYABLE[4],0
+ CALL RECORD_ORDER
+ JNC ORDER_RECORDED
+ PRINTSTRING RED
+ PRINTSTRING LIMIT_MESSAGE
+ PRINTSTRING DEFAULT_COLOR
+ JMP CTNP
+ORDER_RECORDED:
  PRINTSTRING TAXPRICEMSG
- OUTPUTBYTE TQ2
- OUTPUTBYTE "."
- OUTPUTBYTE TR2
- OUTPUTBYTE TQ3
- OUTPUTBYTE TQ4
- 
-;--CHECK WHETHER HAVE VALUE SMALLER THAN 0.01, IF GREATER THAN OR EQUAL TO 5 PLUS 0.01
- MOV AX,0
- MOV DX,0
- CMP BL,5
- JL CALTOTAL
- MOV AX,TAXPRICE
- ADD AX,THOUSAND ;TYX SUBSTRACTION
- MOV TAXPRICE,AX
-
-CALTOTAL: ;46400,5800
- MOV AX,0
- MOV DX,0
- MOV AX,TAXPRICE ;46400 41760
- DIV HUNDRED ;0464 0417
- ADD AX,TOTALPRICE ;AX=464+5800=6264 AX=417+5220
- MOV DX,0 ;---------------------------------TO BE CONTINUE
- DIV HUNDRED ; 62.64 5637
- MOV Q1,AL ;62 56
- MOV R1,DL ;64 37
-
-;--7)MOVE Q1 TO AL, THEN DIV TEN,MOVE QUOTIENT AND REMAINDER RESPECTIVELY TO Q2 AND R2
- MOV AX,0
- MOV DX,0
- MOV AL,Q1 ;AL=62 56
- DIV TEN ;06 05
- MOV Q2,AL ;6 05
- MOV R2,AH ;2 06
-
-;--8)MOVE Q2 TO AL,THEN DIV TEN, MOVE QUOTIENT AND REMAINDER RESPECTIVELY TO Q3 AND R3
- MOV AX,0
- MOV DX,0
- MOV AL,R1 ;AL=64
- DIV TEN ;6.4
- MOV Q3,AL ;6
- MOV R3,AH ;4
-
-;--9)CONVERT DEC TO HEX
- ADD Q2,30H
- ADD R2,30H
- ADD Q3,30H
- ADD R3,30H
-
-;--OUTPUT TOTAL PRICE
+ LEA SI,TAXPRICE
+ MOV CX,FORMAT_MONEY
+ CALL PRINT_UNSIGNED48
  PRINTSTRING DTP
-
- ;--OUTPUT BYTE(Q2)
- OUTPUTBYTE Q2
-
-;--OUTPUT BYTE(R2)
- OUTPUTBYTE R2
-
-;--OUTPUT BYTE(".")
- OUTPUTBYTE "."
-
-;--OUTPUT BYTE(Q3)
- OUTPUTBYTE Q3
-
- ;OUTPUTBYTE R3
- OUTPUTBYTE "0"
+ LEA SI,PAYABLE
+ MOV CX,FORMAT_MONEY
+ CALL PRINT_UNSIGNED48
  PRINTSTRING GREEN
  PRINTSTRING MSG_GO_CONTER
  PRINTSTRING DEFAULT_COLOR
- ;COMPARE FLAVOUR CODE TO ADD QUANTITY FOR SALES REPORT
- MOV AX,0
- CMP FLAVOURCODE,"D"
- JE ADDQTYD
- CMP FLAVOURCODE,"A"
- JE ADDQTYA
- CMP FLAVOURCODE,"O"
- JE ADDQTYO
- CMP FLAVOURCODE,"G"
- JE ADDQTYG
- CMP FLAVOURCODE,"M"
- JE ADDQTYM
-
-;ADD QUANTITY TO SALES QUANTITY FOR SALES REPORT DISPLAY PURPOSE
-ADDQTYD:
- MOV AL,TOTALQTY
- ADD SALESQTY[0],AX
- JMP CTNP
-ADDQTYA:
- MOV AL,TOTALQTY
- ADD SALESQTY[2],AX
- JMP CTNP
-ADDQTYO:
- MOV AL,TOTALQTY
- ADD SALESQTY[4],AX
- JMP CTNP
-ADDQTYG:
- MOV AL,TOTALQTY
- ADD SALESQTY[6],AX
- JMP CTNP
-ADDQTYM:
- MOV AL,TOTALQTY
- ADD SALESQTY[8],AX
  JMP CTNP
 
 ;OUTPUT INVALID MESSAGE
@@ -2110,15 +1407,18 @@ CTNP:
  JE EXIT2_LOGIN_PAGE;--- CHANGE TO LOGIN
  JNE ERRORYN
  CONTINUE_TO_MENU:
-     MOV RETURN_FLAG,1
+     MOV RETURN_FLAG,RETURN_TO_MENU
      JMP END_CAL_TAXNTOTAL 
  EXIT2_LOGIN_PAGE:
-     MOV RETURN_FLAG,2
+     MOV RETURN_FLAG,RETURN_TO_LOGIN
      JMP END_CAL_TAXNTOTAL
  END_CAL_TAXNTOTAL:
      RET
 CAL_TAXNTOTAL ENDP
 
+; ---- Admin controls --------------------------------------------------
+; 1=report, 2=toggle orders, 3=exit process, 4=return to login.
+; JUMP is the result consumed by MAIN: 1=exit, 0=login.
 ADMIN_INTERFACE_P PROC
     MOV ERROR,0
     
@@ -2202,182 +1502,4 @@ AC_2_P PROC
     END_AC_2_P:
     RET
 AC_2_P ENDP
-PRINTQUANT_SP PROC
-    MOV SI,0
-    MOV B_VALID_GE0,0
-    ; WHILE LOOP 
-    PRINTSP_QUANT:
-        CMP B_VALID_GE0,0; IF B_VALID_GE0
-        JE CKCGE0;if false
-        JG PRINTNUM_QTY ;else
-        CKCGE0:
-            CMP SPQUANTITY[SI],30H;check more than 0
-            JE PRINT_SPACE
-            JG PRINT_NUMSALESQTY
-
-            PRINT_SPACE:
-                OUTPUTBYTE " "
-                JMP END_PRINTQUANT_SP_LOOP
-
-            PRINT_NUMSALESQTY:
-                MOV AL,SPQUANTITY[SI]
-                OUTPUTBYTE AL
-                MOV B_VALID_GE0,1
-                JMP END_PRINTQUANT_SP_LOOP
-            
-        PRINTNUM_QTY:
-                MOV AL,SPQUANTITY[SI]
-                OUTPUTBYTE AL
-                JMP END_PRINTQUANT_SP_LOOP
-            END_PRINTQUANT_SP_LOOP:
-                INC SI
-                CMP SI,2
-                JLE PRINTSP_QUANT
-
-        MOV AL,SPQUANTITY[SI]
-        OUTPUTBYTE AL
-    RET    
-            
-PRINTQUANT_SP ENDP
-
-
-PRINTPRICE_SP PROC
-    MOV SI,0
-    MOV B_VALID_GE0,0
-    ; WHILE LOOP 
-    PRINTSP_PRICE:
-        CMP B_VALID_GE0,0; IF B_VALID_GE0
-        JE CKCPRICE;if false
-        JG PRINTNUM_PRICE ;else
-        CKCPRICE:
-            CMP SPPRICE[SI],30H;check more than 0
-            JE PRINT_SPACEPRICE
-            JG PRINT_NUMSALESPRICE
-
-            PRINT_SPACEPRICE:
-                OUTPUTBYTE " "
-                JMP END_PRINTPRICE_SP_LOOP
-
-            PRINT_NUMSALESPRICE:
-                MOV AL,SPPRICE[SI]
-                OUTPUTBYTE AL
-                MOV B_VALID_GE0,1
-                JMP END_PRINTPRICE_SP_LOOP
-            
-        PRINTNUM_PRICE:
-                MOV AL,SPPRICE[SI]
-                OUTPUTBYTE AL
-                JMP END_PRINTPRICE_SP_LOOP
-            END_PRINTPRICE_SP_LOOP:
-                INC SI
-                CMP SI,3
-                JLE PRINTSP_PRICE
-
-        MOV AL,SPPRICE[SI]
-        OUTPUTBYTE AL
-        INC SI
-        MOV AL,SPPRICE[SI]
-        OUTPUTBYTE AL
-        INC SI
-        MOV AL,SPPRICE[SI]
-        OUTPUTBYTE AL
-        INC SI
-        MOV AL,SPPRICE[SI]
-        OUTPUTBYTE AL
-    RET
-PRINTPRICE_SP ENDP
-
-PRINTPRICE_SUBTP PROC
-    MOV SI,0
-    MOV B_VALID_GE0,0
-    ; WHILE LOOP 
-    PRINTSP_SUBPRICE:
-        CMP B_VALID_GE0,0; IF B_VALID_GE0
-        JE CKCSUBPRICE;if false
-        JG PRINTNUM_SUBPRICE ;else
-        CKCSUBPRICE:
-            CMP SPSUBPRICE[SI],30H;check more than 0
-            JE PRINT_SPACESUBPRICE
-            JG PRINT_NUMSALESSUBPRICE
-
-            PRINT_SPACESUBPRICE:
-                OUTPUTBYTE " "
-                JMP END_PRINTSUBPRICE_SP_LOOP
-
-            PRINT_NUMSALESSUBPRICE:
-                MOV AL,SPSUBPRICE[SI]
-                OUTPUTBYTE AL
-                MOV B_VALID_GE0,1
-                JMP END_PRINTSUBPRICE_SP_LOOP
-            
-        PRINTNUM_SUBPRICE:
-                MOV AL,SPSUBPRICE[SI]
-                OUTPUTBYTE AL
-                JMP END_PRINTSUBPRICE_SP_LOOP
-            END_PRINTSUBPRICE_SP_LOOP:
-                INC SI
-                CMP SI,2
-                JLE PRINTSP_SUBPRICE
-
-        MOV AL,SPSUBPRICE[SI]
-        OUTPUTBYTE AL
-        INC SI
-        MOV AL,SPSUBPRICE[SI]
-        OUTPUTBYTE AL
-        INC SI
-        MOV AL,SPSUBPRICE[SI]
-        OUTPUTBYTE AL
-        INC SI
-        MOV AL,SPSUBPRICE[SI]
-        OUTPUTBYTE AL
-    RET
-PRINTPRICE_SUBTP ENDP
-
-PRINTPRICE_TAXP PROC
-        MOV SI,0
-    MOV B_VALID_GE0,0
-    ; WHILE LOOP 
-    PRINTSP_TAXPRICE:
-        CMP B_VALID_GE0,0; IF B_VALID_GE0
-        JE CKCSUBPRICETAX;if false
-        JG PRINT_NUMSALESTAXRICE ;else
-        CKCSUBPRICETAX:
-            CMP SPTAXP[SI],30H;check more than 0
-            JE PRINT_SPACETAXPRICE
-            JG NUMSALESTAXRICE
-
-            PRINT_SPACETAXPRICE:
-                OUTPUTBYTE " "
-                JMP END_PRINTTAXPRICE_SP_LOOP
-
-            PRINT_NUMSALESTAXRICE:
-                MOV AL,SPTAXP[SI]
-                OUTPUTBYTE AL
-                MOV B_VALID_GE0,1
-                JMP END_PRINTTAXPRICE_SP_LOOP
-            
-        NUMSALESTAXRICE:
-                MOV AL,SPTAXP[SI]
-                OUTPUTBYTE AL
-                JMP END_PRINTTAXPRICE_SP_LOOP
-            END_PRINTTAXPRICE_SP_LOOP:
-                INC SI
-                CMP SI,1
-                JLE PRINTSP_TAXPRICE
-
-        MOV AL,SPTAXP[SI]
-        OUTPUTBYTE AL
-        INC SI
-        MOV AL,SPTAXP[SI]
-        OUTPUTBYTE AL
-        INC SI
-        MOV AL,SPTAXP[SI]
-        OUTPUTBYTE AL
-        INC SI
-        MOV AL,SPTAXP[SI]
-        OUTPUTBYTE AL
-    RET
-PRINTPRICE_TAXP ENDP
-
-
     END MAIN
